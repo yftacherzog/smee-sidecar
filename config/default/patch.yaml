@@ -1,0 +1,54 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gosmee-client
+spec:
+  template:
+    spec:
+      volumes:
+        - name: health-check-volume
+          emptyDir: {}
+      containers:
+        - name: gosmee
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 2
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: health-check-volume
+              mountPath: /tmp/health
+        - name: health-check-sidecar
+          # TODO: replace once we have a release
+          image: quay.io/yftacherzog/smee-sidecar@sha256:ffba8d63731ab33abdeabe4fc4622e4203d6843c9f6bde053f1300bb7774c186
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9100
+          # Patch this with the channel and the downstream service
+          # env:
+          # - name: DOWNSTREAM_SERVICE_URL
+          #   value: "http://pipelines-as-code-controller.pipelines-as-code:8080"
+          # - name: SMEE_CHANNEL_URL
+          #   value: "https://smee.io/abcdefg"
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 2
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: health-check-volume
+              mountPath: /tmp/health
