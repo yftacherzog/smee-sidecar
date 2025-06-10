@@ -1,0 +1,73 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smee-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gosmee
+  namespace: smee-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gosmee
+  template:
+    metadata:
+      labels:
+        app: gosmee
+    spec:
+      volumes:
+        - name: health-check-volume
+          emptyDir: {}
+      containers:
+        - image: "ghcr.io/chmouel/gosmee:v0.20.2"
+          # imagePullPolicy: Always
+          name: gosmee
+          args: ["server", "--address", "0.0.0.0"]
+          ports:
+            - name: "gosmee-http"
+              containerPort: 3333
+              protocol: TCP
+          livenessProbe:
+            exec:
+              # Using the comprehensive and robust arithmetic check, which is confirmed
+              # to work in this container's shell environment.
+              command:
+              - sh
+              - -c
+              - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
+            # Timings can be tuned but these are a sensible default.
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 3 # (20s * 3 = 60s total failure time before restart)
+            timeoutSeconds: 5
+          # securityContext:
+          #   readOnlyRootFilesystem: true
+          #   runAsNonRoot: true
+          # resources:
+          #   limits:
+          #     cpu: 1
+          #     memory: 256Mi
+          #   requests:
+          #     cpu: 1
+          #     memory: 256Mi
+          volumeMounts:
+            - name: health-check-volume
+              mountPath: /tmp/health
+
+        - name: health-check-sidecar
+          imagePullPolicy: Always
+          image: quay.io/yftacherzog/smee-sidecar:foo
+          # Use args to run the sidecar in "server-check" mode
+          args:
+            - "server-check"
+          env:
+            # The sidecar checks the server on localhost
+            - name: SMEE_SERVER_URL
+              value: "http://localhost:3333"
+          volumeMounts:
+            - name: health-check-volume
+              mountPath: /tmp/health

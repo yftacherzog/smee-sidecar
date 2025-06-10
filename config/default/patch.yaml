@@ -26,8 +26,10 @@ spec:
               mountPath: /tmp/health
         - name: health-check-sidecar
           # TODO: replace once we have a release
-          image: quay.io/yftacherzog/smee-sidecar@sha256:ffba8d63731ab33abdeabe4fc4622e4203d6843c9f6bde053f1300bb7774c186
+          image: quay.io/yftacherzog/smee-sidecar:foo
           imagePullPolicy: Always
+          args:
+            - "client-check"
           ports:
             - name: http
               containerPort: 8080
