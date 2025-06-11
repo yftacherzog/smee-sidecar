@@ -24,7 +24,7 @@ spec:
           emptyDir: {}
       containers:
         - image: "ghcr.io/chmouel/gosmee:v0.26.0"
-          # imagePullPolicy: Always
+          imagePullPolicy: Always
           name: gosmee
           args: ["server", "--address", "0.0.0.0"]
           ports:
@@ -36,38 +36,77 @@ spec:
               # Using the comprehensive and robust arithmetic check, which is confirmed
               # to work in this container's shell environment.
               command:
-              - sh
-              - -c
-              - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
+                - sh
+                - -c
+                - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
             # Timings can be tuned but these are a sensible default.
             initialDelaySeconds: 60
             periodSeconds: 20
             failureThreshold: 3 # (20s * 3 = 60s total failure time before restart)
             timeoutSeconds: 5
-          # securityContext:
-          #   readOnlyRootFilesystem: true
-          #   runAsNonRoot: true
-          # resources:
-          #   limits:
-          #     cpu: 1
-          #     memory: 256Mi
-          #   requests:
-          #     cpu: 1
-          #     memory: 256Mi
           volumeMounts:
             - name: health-check-volume
               mountPath: /tmp/health
+
+        - name: gosmee-health-check-client
+          image: ghcr.io/chmouel/gosmee:v0.26.0
+          args:
+            - client
+            - http://localhost:3333/smeehealthcheckchannel
+            - http://localhost:8080
+          imagePullPolicy: Always
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - (( $(date +%s) - $(cat /tmp/health/live) < 90 ))
+            failureThreshold: 2
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 5
+          ports:
+            - containerPort: 8081
+              name: health
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 32Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /tmp/health
+              name: health-check-volume
 
         - name: health-check-sidecar
           imagePullPolicy: Always
           image: quay.io/yftacherzog/smee-sidecar:foo
           # Use args to run the sidecar in "server-check" mode
-          args:
-            - "server-check"
+          # args:
+          #   # - "server-check"
+          #   - "client-check"
           env:
             # The sidecar checks the server on localhost
-            - name: SMEE_SERVER_URL
-              value: "http://localhost:3333"
+            - name: DOWNSTREAM_SERVICE_URL
+              value: http://pipelines-as-code-controller.pipelines-as-code:8080
+            - name: SMEE_CHANNEL_URL
+              value: http://localhost:3333/smeehealthcheckchannel
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+            - containerPort: 9100
+              name: metrics
+              protocol: TCP
           volumeMounts:
             - name: health-check-volume
               mountPath: /tmp/health
