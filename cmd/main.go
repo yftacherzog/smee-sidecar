@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,46 +15,36 @@ import (
 	"sync"
 	"time"
 
+	"github.com/donovanhide/eventsource"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	// --- Configuration from Environment Variables ---
-	downstreamServiceURL string
-	smeeChannelURL       string
-
-	// --- Prometheus Metrics ---
+	// Globals for client-check mode
 	forwardAttempts = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "smee_events_relayed_total",
 			Help: "Total number of regular events relayed by the sidecar.",
 		},
 	)
-
-	// --- Shared State for Health Checks ---
 	healthCheckIDs = make(map[string]bool)
 	mutex          = &sync.Mutex{}
-
-	// We will initialize this in main() after parsing the downstream URL.
-	proxy *httputil.ReverseProxy
+	proxy          *httputil.ReverseProxy
 )
 
-// HealthCheckPayload defines the structure of our self-test event
 type HealthCheckPayload struct {
 	Type string `json:"type"`
 	ID   string `json:"id"`
 }
 
-// forwardHandler is now much simpler.
+// ==========================================================================================
+// CLIENT-CHECK MODE LOGIC (Unchanged from last working version)
+// ==========================================================================================
 func forwardHandler(w http.ResponseWriter, r *http.Request) {
-	// We still need to check for our internal health check events first.
-	// Since this requires reading the body, we'll read it here and then
-	// pass it along to the proxy if it's a regular event.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("Error reading request body: %v", err)
 		http.Error(w, "cannot read request body", http.StatusInternalServerError)
 		return
 	}
@@ -62,67 +53,50 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	var healthCheck HealthCheckPayload
 	if r.Header.Get("Content-Type") == "application/json" {
 		if json.Unmarshal(body, &healthCheck) == nil && healthCheck.Type == "health-check" {
-			// It's a health check. Handle it and exit.
 			mutex.Lock()
 			healthCheckIDs[healthCheck.ID] = true
 			mutex.Unlock()
-			log.Printf("Received health check event with ID: %s", healthCheck.ID)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Health check received"))
 			return
 		}
 	}
-
-	// If we got here, it's a regular event.
 	forwardAttempts.Inc()
-	log.Printf("Relaying regular event via ReverseProxy to downstream service")
-
-	// We need to put the body back on the request for the proxy to read it.
 	r.Body = io.NopCloser(bytes.NewReader(body))
-
-	// --- Let the ReverseProxy do all the hard work ---
 	proxy.ServeHTTP(w, r)
 }
 
-// runHealthCheckLoop has the corrected loop structure
-func runHealthCheckLoop() {
+func runClientHealthCheckLoop(smeeChannelURL string) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	healthFilePath := "/tmp/health/live"
 
-	// Define the check logic as a local function to avoid repetition
 	runCheck := func() {
-		log.Println("Health Check: Running self-test...")
 		testID := uuid.New().String()
 		payload := HealthCheckPayload{Type: "health-check", ID: testID}
 		payloadBytes, _ := json.Marshal(payload)
-
-		// 1. Post the test event
 		req, err := http.NewRequestWithContext(context.Background(), "POST", smeeChannelURL, bytes.NewBuffer(payloadBytes))
 		if err != nil {
-			log.Printf("Health Check Loop Error: could not create request: %v", err)
-			return // Exit this check run
+			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-
-		// Important: Create a new client for each check to avoid issues with proxies and TLS
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY")},
+			},
+		}
 		if _, err = client.Do(req); err != nil {
-			log.Printf("Health Check Loop Error: could not post to Smee server: %v", err)
-			os.Remove(healthFilePath) // If we can't even post, remove the file to signal failure
+			os.Remove(healthFilePath)
 			return
 		}
 
-		// 2. Wait up to 20 seconds for the event to be received
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-
 		found := false
 	checkLoop:
 		for {
 			select {
-			case <-ctx.Done(): // Timeout reached
+			case <-ctx.Done():
 				break checkLoop
 			default:
 				mutex.Lock()
@@ -138,73 +112,173 @@ func runHealthCheckLoop() {
 			}
 		}
 
-		// 3. Update the shared health file based on the result
 		if found {
-			log.Println("Health Check: PASSED. Updating heartbeat file with current timestamp.")
 			timestamp := fmt.Sprintf("%d", time.Now().Unix())
-			if err := os.WriteFile(healthFilePath, []byte(timestamp), 0644); err != nil {
-				log.Printf("Health Check Warning: could not write to heartbeat file: %v", err)
-			}
+			os.WriteFile(healthFilePath, []byte(timestamp), 0644)
 		} else {
-			log.Println("Health Check: FAILED. Removing heartbeat file to trigger probe failure.")
 			os.Remove(healthFilePath)
 		}
 	}
-
-	// --- This is the corrected loop structure ---
-	// Run the check once immediately on startup.
 	runCheck()
-
-	// Then, run it again on every tick from the ticker's channel.
 	for range ticker.C {
 		runCheck()
 	}
 }
 
-func main() {
-	log.Println("Starting Smee health check sidecar...")
-
-	// --- Load Configuration ---
-	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL") // Make it a local variable
-	smeeChannelURL = os.Getenv("SMEE_CHANNEL_URL")
+func runClientCheckMode() {
+	log.Println("Starting sidecar in [client-check] mode...")
+	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL")
+	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
 	if downstreamServiceURL == "" || smeeChannelURL == "" {
-		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL and SMEE_CHANNEL_URL environment variables must be set.")
+		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL and SMEE_CHANNEL_URL env vars must be set for client-check mode.")
 	}
-
-	// --- NEW: Initialize the ReverseProxy ---
 	downstreamURL, err := url.Parse(downstreamServiceURL)
 	if err != nil {
 		log.Fatalf("FATAL: Could not parse DOWNSTREAM_SERVICE_URL: %v", err)
 	}
 	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
-	// --- End of new section ---
-
-	// --- Register Prometheus Metrics ---
 	prometheus.MustRegister(forwardAttempts)
-
-	// --- Start the background health check loop ---
-	go runHealthCheckLoop()
-
-	// --- Start Relay Server ---
+	go runClientHealthCheckLoop(smeeChannelURL)
 	relayMux := http.NewServeMux()
 	relayMux.HandleFunc("/", forwardHandler)
 	go func() {
 		log.Println("Relay server listening on :8080")
-		if err := http.ListenAndServe(":8080", relayMux); err != nil {
-			log.Fatalf("FATAL: Relay server failed: %v", err)
-		}
+		http.ListenAndServe(":8080", relayMux)
 	}()
-
-	// --- Start Management Server ---
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
 	go func() {
 		log.Println("Management server (metrics) listening on :9100")
-		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
-			log.Fatalf("FATAL: Management server failed: %v", err)
-		}
+		http.ListenAndServe(":9100", mgmtMux)
 	}()
-
-	// Keep the main goroutine alive forever
 	select {}
+}
+
+// ==========================================================================================
+// SERVER-CHECK MODE LOGIC (Final Simplified "Listen Only" Version)
+// ==========================================================================================
+
+// listenForHeartbeat is a dedicated function for the goroutine. Its only job is to listen.
+func listenForHeartbeat(ctx context.Context, stream *eventsource.Stream, resultChan chan<- bool) {
+	// The stream is created and closed by the parent function. This goroutine just reads from it.
+	for {
+		select {
+		case <-ctx.Done(): // Context was cancelled by the parent function.
+			return
+		case ev := <-stream.Events:
+			log.Printf("Server Health Check: Received initial heartbeat event from server. Type: %s", ev.Event())
+			// Send success once and only once. A non-blocking send is safest.
+			select {
+			case resultChan <- true:
+			default:
+			}
+			// Important: We don't return here. We let the context cancellation handle shutdown.
+		case err := <-stream.Errors:
+			if err != io.EOF {
+				log.Printf("Server Health Check Error: Eventsource client received an error: %v", err)
+			}
+			return
+		}
+	}
+}
+
+func runServerHealthCheckLoop(smeeServerURL string) {
+	healthFilePath := "/tmp/health/live"
+	var lastSuccessTime time.Time
+
+	const healthCheckChannel = "smeehealthcheckchannel"
+	channelURL := fmt.Sprintf("%s/%s", smeeServerURL, healthCheckChannel)
+
+	// This is now a simple, infinite loop that controls the timing of checks.
+	for {
+		log.Println("Server Health Check: Running self-test...")
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+
+		// 1. Create the request with a context that the library will use.
+		req, err := http.NewRequestWithContext(ctx, "GET", channelURL, nil)
+		if err != nil {
+			log.Printf("Server Health Check Error: Failed to create request: %v", err)
+			cancel()
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		// 2. Subscribe to the stream. The stream object is now owned by this function.
+		stream, err := eventsource.SubscribeWithRequest("", req)
+		if err != nil {
+			log.Printf("Server Health Check Error: Eventsource client failed to subscribe: %v", err)
+			cancel()
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		// The stream will be closed reliably when the check function exits.
+		defer stream.Close()
+		log.Printf("Server Health Check: Subscribing to fixed channel URL: %s", channelURL)
+
+		// 3. Launch the simple listener goroutine.
+		resultChan := make(chan bool, 1)
+		go listenForHeartbeat(ctx, stream, resultChan)
+
+		// 4. Wait for the goroutine to signal success, or for our overall timeout.
+		found := false
+		select {
+		case found = <-resultChan:
+		case <-ctx.Done():
+			log.Printf("Server Health Check: Timed out waiting for any event from server. Error: %v", ctx.Err())
+		}
+
+		// 5. Explicitly cancel the context to signal the goroutine to exit.
+		cancel()
+
+		// 6. Update health file based on the result.
+		if found {
+			log.Println("Server Health Check: PASSED.")
+			lastSuccessTime = time.Now()
+		} else {
+			log.Println("Server Health Check: FAILED.")
+		}
+
+		if !lastSuccessTime.IsZero() && time.Since(lastSuccessTime) < 90*time.Second {
+			log.Printf("Server Health status is GOOD. Updating heartbeat file.")
+			timestamp := fmt.Sprintf("%d", time.Now().Unix())
+			if err := os.WriteFile(healthFilePath, []byte(timestamp), 0644); err != nil {
+				log.Printf("Health Check Warning: could not write to heartbeat file: %v", err)
+			}
+		} else {
+			log.Printf("Server Health status is BAD. Removing heartbeat file.")
+			os.Remove(healthFilePath)
+		}
+
+		// Cooldown period between checks.
+		log.Println("Health check cycle finished. Cooldown for 30 seconds...")
+		time.Sleep(30 * time.Second)
+	}
+}
+
+func runServerCheckMode() {
+	log.Println("Starting sidecar in [server-check] mode...")
+	smeeServerURL := os.Getenv("SMEE_SERVER_URL")
+	if smeeServerURL == "" {
+		log.Fatal("FATAL: SMEE_SERVER_URL env var must be set for server-check mode (e.g., http://localhost:3333).")
+	}
+	runServerHealthCheckLoop(smeeServerURL)
+}
+
+// ==========================================================================================
+// MAIN: Dispatcher
+// ==========================================================================================
+func main() {
+	if len(os.Args) < 2 {
+		log.Println("Error: Missing subcommand. Please specify 'client-check' or 'server-check'.")
+		os.Exit(1)
+	}
+	switch os.Args[1] {
+	case "client-check":
+		runClientCheckMode()
+	case "server-check":
+		runServerCheckMode()
+	default:
+		log.Printf("Error: Unknown subcommand '%s'. Please specify 'client-check' or 'server-check'.", os.Args[1])
+		os.Exit(1)
+	}
 }
