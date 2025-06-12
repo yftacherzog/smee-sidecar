@@ -27,9 +27,11 @@ var (
 			Help: "Total number of regular events relayed by the sidecar.",
 		},
 	)
-	healthCheckIDs = make(map[string]bool)
-	mutex          = &sync.Mutex{}
-	proxy          *httputil.ReverseProxy
+	// The mutex protects a map where the KEY is the test ID
+	// and the VALUE is a channel that the handler will wait on.
+	healthChecks = make(map[string]chan bool)
+	mutex        = &sync.Mutex{}
+	proxy        *httputil.ReverseProxy
 )
 
 type HealthCheckPayload struct {
@@ -37,11 +39,10 @@ type HealthCheckPayload struct {
 	ID   string `json:"id"`
 }
 
-// forwardHandler proxies requests and intercepts health check events.
+// forwardHandler needs to find the correct channel to signal success.
 func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("Error reading request body: %v", err)
 		http.Error(w, "cannot read request body", http.StatusInternalServerError)
 		return
 	}
@@ -51,123 +52,99 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Content-Type") == "application/json" {
 		if json.Unmarshal(body, &healthCheck) == nil && healthCheck.Type == "health-check" {
 			mutex.Lock()
-			healthCheckIDs[healthCheck.ID] = true
+			// Find the waiting channel for this specific ID and signal it.
+			if resultChan, ok := healthChecks[healthCheck.ID]; ok {
+				log.Printf("Health Check: Intercepted health check event with ID: %s", healthCheck.ID)
+				resultChan <- true
+				delete(healthChecks, healthCheck.ID) // Clean up the map
+			}
 			mutex.Unlock()
-			log.Printf("Health Check: Intercepted and verified health check event with ID: %s", healthCheck.ID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}
-
 	forwardAttempts.Inc()
-	log.Printf("Relaying regular event via ReverseProxy to downstream service")
-	// We need to put the body back on the request for the proxy to read it.
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	proxy.ServeHTTP(w, r)
 }
 
-// runClientHealthCheckLoop performs the self-test for the smee-client.
-func runClientHealthCheckLoop(smeeChannelURL string) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	healthFilePath := "/tmp/health/live"
-
-	runCheck := func() {
-		log.Println("Health Check: Running self-test...")
-		testID := uuid.New().String()
-		payload := HealthCheckPayload{Type: "health-check", ID: testID}
-		payloadBytes, _ := json.Marshal(payload)
-
-		// Create the request to the external Smee channel
-		req, err := http.NewRequestWithContext(context.Background(), "POST", smeeChannelURL, bytes.NewBuffer(payloadBytes))
-		if err != nil {
-			log.Printf("Health Check Error: could not create request: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		// This client needs to handle potential corporate proxies
-		client := &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY")},
-			},
-		}
-
-		// Post the event
-		if _, err = client.Do(req); err != nil {
-			log.Printf("Health Check Error: could not post to Smee server: %v", err)
-			os.Remove(healthFilePath) // Fail fast if POST fails
-			return
-		}
-
-		// Wait for the event to be received by our own forwardHandler
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		found := false
-	checkLoop:
-		for {
-			select {
-			case <-ctx.Done():
-				break checkLoop
-			default:
-				mutex.Lock()
-				if healthCheckIDs[testID] {
-					delete(healthCheckIDs, testID) // Clean up the ID
-					found = true
-				}
-				mutex.Unlock()
-				if found {
-					break checkLoop
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-
-		// Update the shared health file based on the result
-		if found {
-			log.Println("Health Check: PASSED.")
-			timestamp := fmt.Sprintf("%d", time.Now().Unix())
-			if err := os.WriteFile(healthFilePath, []byte(timestamp), 0644); err != nil {
-				log.Printf("Health Check Warning: could not write to heartbeat file: %v", err)
-			}
-		} else {
-			log.Println("Health Check: FAILED.")
-			os.Remove(healthFilePath)
-		}
+// healthzHandler performs a single, synchronous end-to-end check.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
+	if smeeChannelURL == "" {
+		log.Println("Healthz Error: SMEE_CHANNEL_URL env var is not set.")
+		http.Error(w, "Sidecar not configured", http.StatusInternalServerError)
+		return
 	}
 
-	runCheck()
-	for range ticker.C {
-		runCheck()
+	// The overall timeout for the probe to complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testID := uuid.New().String()
+	payload := HealthCheckPayload{Type: "health-check", ID: testID}
+	payloadBytes, _ := json.Marshal(payload)
+
+	// Create a channel for this specific request and register it.
+	resultChan := make(chan bool, 1)
+	mutex.Lock()
+	healthChecks[testID] = resultChan
+	mutex.Unlock()
+
+	// Ensure we always clean up the map entry for this ID.
+	defer func() {
+		mutex.Lock()
+		delete(healthChecks, testID)
+		mutex.Unlock()
+	}()
+
+	// Create and send the POST request.
+	req, err := http.NewRequestWithContext(ctx, "POST", smeeChannelURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		http.Error(w, "Failed to create health check request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY")},
+		},
+	}
+
+	if _, err = client.Do(req); err != nil {
+		log.Printf("Healthz Error: could not post to Smee server: %v", err)
+		http.Error(w, "Failed to POST to Smee server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Wait for the forwardHandler to receive the event, or for the timeout.
+	select {
+	case <-resultChan:
+		log.Println("Healthz check PASSED.")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "OK")
+	case <-ctx.Done():
+		log.Println("Healthz check FAILED: timed out waiting for event round-trip.")
+		http.Error(w, "Health check timed out", http.StatusServiceUnavailable)
 	}
 }
 
-// main function now directly starts the client-check sidecar.
 func main() {
 	log.Println("Starting Smee instrumentation sidecar...")
 
-	// --- Load Configuration ---
 	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL")
-	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
-	if downstreamServiceURL == "" || smeeChannelURL == "" {
-		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL and SMEE_CHANNEL_URL environment variables must be set.")
+	if downstreamServiceURL == "" {
+		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL environment variable must be set.")
 	}
-
-	// --- Initialize the ReverseProxy ---
 	downstreamURL, err := url.Parse(downstreamServiceURL)
 	if err != nil {
 		log.Fatalf("FATAL: Could not parse DOWNSTREAM_SERVICE_URL: %v", err)
 	}
 	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
 
-	// --- Register Prometheus Metrics ---
 	prometheus.MustRegister(forwardAttempts)
 
-	// --- Start the background health check loop ---
-	go runClientHealthCheckLoop(smeeChannelURL)
-
-	// --- Start Relay Server (on port 8080) ---
+	// --- Relay Server (on port 8080) ---
 	relayMux := http.NewServeMux()
 	relayMux.HandleFunc("/", forwardHandler)
 	go func() {
@@ -177,16 +154,16 @@ func main() {
 		}
 	}()
 
-	// --- Start Management Server (on port 9100) ---
+	// --- Management Server (on port 9100) ---
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
+	mgmtMux.HandleFunc("/healthz", healthzHandler)
 	go func() {
-		log.Println("Management server (metrics) listening on :9100")
+		log.Println("Management server (metrics, healthz) listening on :9100")
 		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
 			log.Fatalf("FATAL: Management server failed: %v", err)
 		}
 	}()
 
-	// Keep the main goroutine alive forever
 	select {}
 }

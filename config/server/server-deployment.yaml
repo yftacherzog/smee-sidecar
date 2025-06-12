@@ -19,9 +19,6 @@ spec:
       labels:
         app: gosmee
     spec:
-      volumes:
-        - name: health-check-volume
-          emptyDir: {}
       containers:
         - image: "ghcr.io/chmouel/gosmee:v0.26.0"
           imagePullPolicy: Always
@@ -32,22 +29,13 @@ spec:
               containerPort: 3333
               protocol: TCP
           livenessProbe:
-            exec:
-              # Using the comprehensive and robust arithmetic check, which is confirmed
-              # to work in this container's shell environment.
-              command:
-                - sh
-                - -c
-                - "(( $(date +%s) - $(cat /tmp/health/live) < 90 ))"
-            # Timings can be tuned but these are a sensible default.
-            initialDelaySeconds: 60
-            periodSeconds: 20
-            failureThreshold: 3 # (20s * 3 = 60s total failure time before restart)
-            timeoutSeconds: 5
-          volumeMounts:
-            - name: health-check-volume
-              mountPath: /tmp/health
-
+            httpGet:
+              path: /healthz
+              port: 9100 # The sidecar's management port
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 25 # Must be > the healthz handler's timeout
+            failureThreshold: 2
         - name: gosmee-health-check-client
           image: ghcr.io/chmouel/gosmee:v0.26.0
           args:
@@ -56,16 +44,13 @@ spec:
             - http://localhost:8080
           imagePullPolicy: Always
           livenessProbe:
-            exec:
-              command:
-                - sh
-                - -c
-                - (( $(date +%s) - $(cat /tmp/health/live) < 90 ))
-            failureThreshold: 2
-            initialDelaySeconds: 45
+            httpGet:
+              path: /healthz
+              port: 9100 # The sidecar's management port
+            initialDelaySeconds: 30
             periodSeconds: 30
-            successThreshold: 1
-            timeoutSeconds: 5
+            timeoutSeconds: 25 # Must be > the healthz handler's timeout
+            failureThreshold: 2
           ports:
             - containerPort: 8081
               name: health
@@ -83,17 +68,9 @@ spec:
             runAsUser: 1001
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
-          volumeMounts:
-            - mountPath: /tmp/health
-              name: health-check-volume
-
         - name: health-check-sidecar
           imagePullPolicy: Always
-          image: quay.io/yftacherzog/smee-sidecar:foo
-          # Use args to run the sidecar in "server-check" mode
-          # args:
-          #   # - "server-check"
-          #   - "client-check"
+          image: quay.io/konflux-ci/smee-sidecar:latest
           env:
             # The sidecar checks the server on localhost
             - name: DOWNSTREAM_SERVICE_URL
@@ -107,6 +84,11 @@ spec:
             - containerPort: 9100
               name: metrics
               protocol: TCP
-          volumeMounts:
-            - name: health-check-volume
-              mountPath: /tmp/health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9100 # The sidecar's management port
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 25 # Must be > the healthz handler's timeout
+            failureThreshold: 2
