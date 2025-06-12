@@ -77,6 +77,8 @@ spec:
               value: http://pipelines-as-code-controller.pipelines-as-code:8080
             - name: SMEE_CHANNEL_URL
               value: http://localhost:3333/smeehealthcheckchannel
+            - name: HEALTHZ_TIMEOUT_SECONDS
+              value: 10
           ports:
             - containerPort: 8080
               name: http

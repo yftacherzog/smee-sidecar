@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -77,8 +78,20 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read timeout from environment variable, with a default of 20 seconds.
+	timeoutSeconds := 20
+	if timeoutStr := os.Getenv("HEALTHZ_TIMEOUT_SECONDS"); timeoutStr != "" {
+		if val, err := strconv.Atoi(timeoutStr); err == nil && val > 0 {
+			timeoutSeconds = val
+			log.Printf("Using custom healthz timeout: %d seconds", timeoutSeconds)
+		} else {
+			log.Printf("Invalid HEALTHZ_TIMEOUT_SECONDS value '%s'. Falling back to default of %d seconds.", timeoutStr, timeoutSeconds)
+		}
+	}
+
 	// The overall timeout for the probe to complete.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	timeoutDuration := time.Duration(timeoutSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
 
 	testID := uuid.New().String()
