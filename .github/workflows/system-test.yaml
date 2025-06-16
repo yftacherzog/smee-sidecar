@@ -1,0 +1,48 @@
+name: System Test on Kind
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  system-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Create k8s Kind Cluster
+        uses: helm/kind-action@v1.9.0
+        with:
+          cluster_name: kind
+
+      - name: Build sidecar image
+        run: |
+          docker build -t smee-sidecar-test:latest .
+
+      - name: Load image into Kind
+        run: |
+          kind load docker-image smee-sidecar-test:latest
+
+      - name: Deploy applications to Kind
+        run: |
+          kubectl apply -f test/config/system-test-setup.yaml
+
+      - name: Wait for deployments to be available
+        run: |
+          kubectl wait --for=condition=Available deployment/smee-server --timeout=60s
+          kubectl wait --for=condition=Available deployment/smee-client --timeout=60s
+          echo "All deployments are ready."
+
+      - name: Run system test script
+        run: |
+          # chmod +x ./run-system-test.sh
+          test/scripts/run-system-test.sh
