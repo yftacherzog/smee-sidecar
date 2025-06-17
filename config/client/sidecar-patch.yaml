@@ -11,7 +11,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 9100 # The sidecar's management port
+              port: 9100
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 25 # Must be > the healthz handler's timeout
@@ -25,15 +25,15 @@ spec:
             - name: metrics
               containerPort: 9100
           # Patch this with the channel and the downstream service
-          # env:
-          # - name: DOWNSTREAM_SERVICE_URL
-          #   value: "http://pipelines-as-code-controller.pipelines-as-code:8080"
-          # - name: SMEE_CHANNEL_URL
-          #   value: "https://smee.io/abcdefg"
+          env:
+          - name: DOWNSTREAM_SERVICE_URL
+            value: "http://pipelines-as-code-controller.pipelines-as-code:8080"
+          - name: SMEE_CHANNEL_URL
+            value: "https://smee.io/abcdefg"
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 9100 # The sidecar's management port
+              port: 9100
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 25 # Must be > the healthz handler's timeout
