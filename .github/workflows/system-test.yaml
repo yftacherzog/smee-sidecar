@@ -44,5 +44,4 @@ jobs:
 
       - name: Run system test script
         run: |
-          # chmod +x ./run-system-test.sh
           test/scripts/run-system-test.sh
