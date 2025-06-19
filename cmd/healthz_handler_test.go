@@ -8,6 +8,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 var _ = Describe("healthzHandler", func() {
@@ -25,6 +27,14 @@ var _ = Describe("healthzHandler", func() {
 		mutex.Lock()
 		healthChecks = make(map[string]chan bool)
 		mutex.Unlock()
+
+		// Re-create the gauge before each test to reset its value and state.
+		health_check = prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "health_check",
+				Help: "Indicates the outcome of the last completed health check (1 for OK, 0 for failure).",
+			},
+		)
 	})
 
 	AfterEach(func() {
@@ -61,10 +71,12 @@ var _ = Describe("healthzHandler", func() {
 			os.Setenv("SMEE_CHANNEL_URL", mockSmeeServer.URL)
 		})
 
-		It("should return a 200 OK status", func() {
+		It("should return a 200 OK status and set the health_check metric to 1", func() {
 			healthzHandler(recorder, request)
 			Expect(recorder.Code).To(Equal(http.StatusOK))
 			Expect(recorder.Body.String()).To(ContainSubstring("OK"))
+			// Verify that the gauge is set to 1 for success.
+			Expect(testutil.ToFloat64(health_check)).To(Equal(1.0))
 		})
 	})
 
@@ -82,10 +94,12 @@ var _ = Describe("healthzHandler", func() {
 			os.Setenv("HEALTHZ_TIMEOUT_SECONDS", "1")
 		})
 
-		It("should return a 503 Service Unavailable status", func() {
+		It("should return a 503 Service Unavailable status and set the health_check metric to 0", func() {
 			healthzHandler(recorder, request)
 			Expect(recorder.Code).To(Equal(http.StatusServiceUnavailable))
 			Expect(recorder.Body.String()).To(ContainSubstring("Health check timed out"))
+			// Verify that the gauge is set to 0 for failure.
+			Expect(testutil.ToFloat64(health_check)).To(Equal(0.0))
 		})
 	})
 
@@ -95,10 +109,12 @@ var _ = Describe("healthzHandler", func() {
 			os.Unsetenv("SMEE_CHANNEL_URL")
 		})
 
-		It("should return a 500 Internal Server Error", func() {
+		It("should return a 500 Internal Server Error and set the health_check metric to 0", func() {
 			healthzHandler(recorder, request)
 			Expect(recorder.Code).To(Equal(http.StatusInternalServerError))
 			Expect(recorder.Body.String()).To(ContainSubstring("Sidecar not configured"))
+			// Verify that the gauge is set to 0 for failure.
+			Expect(testutil.ToFloat64(health_check)).To(Equal(0.0))
 		})
 	})
 })

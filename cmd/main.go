@@ -28,6 +28,13 @@ var (
 			Help: "Total number of regular events relayed by the sidecar.",
 		},
 	)
+	// Gauge metric to track the health check status.
+	health_check = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "health_check",
+			Help: "Indicates the outcome of the last completed health check (1 for OK, 0 for failure).",
+		},
+	)
 	// The mutex protects a map where the KEY is the test ID
 	// and the VALUE is a channel that the handler will wait on.
 	healthChecks = make(map[string]chan bool)
@@ -71,6 +78,13 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 
 // healthzHandler performs a single, synchronous end-to-end check.
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	// healthStatus will be 0 (failure) by default. It is set to 1 upon success.
+	// The defer statement ensures the metric is set only once when the function exits.
+	var healthStatus float64 = 0
+	defer func() {
+		health_check.Set(healthStatus)
+	}()
+
 	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
 	if smeeChannelURL == "" {
 		log.Println("Healthz Error: SMEE_CHANNEL_URL env var is not set.")
@@ -134,6 +148,8 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-resultChan:
 		log.Println("Healthz check PASSED.")
+		// The check was successful, so we'll set the status to 1.
+		healthStatus = 1
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 	case <-ctx.Done():
@@ -155,7 +171,9 @@ func main() {
 	}
 	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
 
+	// Register both metrics with Prometheus.
 	prometheus.MustRegister(forwardAttempts)
+	prometheus.MustRegister(health_check)
 
 	// --- Relay Server (on port 8080) ---
 	relayMux := http.NewServeMux()
