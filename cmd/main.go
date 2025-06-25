@@ -158,6 +158,13 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// livezHandler performs a simple check to see if the process is running.
+// This can be used for a Kubernetes livenessProbe to ensure the HTTP server is responsive.
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "alive")
+}
+
 func main() {
 	log.Println("Starting Smee instrumentation sidecar...")
 
@@ -189,8 +196,9 @@ func main() {
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
 	mgmtMux.HandleFunc("/healthz", healthzHandler)
+	mgmtMux.HandleFunc("/livez", livezHandler)
 	go func() {
-		log.Println("Management server (metrics, healthz) listening on :9100")
+		log.Println("Management server (metrics, healthz, livez) listening on :9100")
 		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
 			log.Fatalf("FATAL: Management server failed: %v", err)
 		}
