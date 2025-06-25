@@ -99,7 +99,7 @@ spec:
               value: "http://smee-server-service.default.svc.cluster.local/systemcheckchannel"
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: 9100
             initialDelaySeconds: 5
             periodSeconds: 3
