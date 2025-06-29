@@ -21,3 +21,7 @@ jobs:
 
       - name: Run unit tests serially
         run: go test -p 1 ./... -v
+
+      - name: Test health check scripts
+        run: |
+          test/scripts/test-health-scripts.sh

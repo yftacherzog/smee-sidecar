@@ -48,6 +48,12 @@ spec:
       labels:
         app: smee-sidecar
     spec:
+      # Set security context to ensure proper permissions for shared volume
+      securityContext:
+        fsGroup: 65532
+      volumes:
+        - name: shared-health
+          emptyDir: {}
       containers:
         - name: gosmee-client
           image: ghcr.io/chmouel/gosmee:v0.26.0
@@ -57,12 +63,13 @@ spec:
             - http://localhost:8080
           imagePullPolicy: IfNotPresent
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 9100
-            initialDelaySeconds: 5
-            periodSeconds: 3
-            timeoutSeconds: 2
+            exec:
+              command:
+                - /bin/bash
+                - /shared/check-smee-health.sh
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 3
             failureThreshold: 2
           ports:
             - containerPort: 8081
@@ -78,13 +85,17 @@ spec:
           securityContext:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
-            runAsUser: 1001
+            runAsUser: 65532
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
+          volumeMounts:
+            - name: shared-health
+              mountPath: /shared
         - name: sidecar
           image: smee-sidecar-test:latest
           # image: quay.io/konflux-ci/smee-sidecar:latest
           imagePullPolicy: IfNotPresent
+          # imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
@@ -97,14 +108,32 @@ spec:
               value: "http://dummy-downstream-service.default.svc.cluster.local:8080"
             - name: SMEE_CHANNEL_URL
               value: "http://smee-server-service.default.svc.cluster.local/systemcheckchannel"
+            - name: SHARED_VOLUME_PATH
+              value: "/shared"
+            - name: HEALTH_FILE_PATH
+              value: "/shared/health-status.txt"
+            - name: HEALTH_CHECK_INTERVAL_SECONDS
+              value: "10"
+            - name: HEALTH_CHECK_TIMEOUT_SECONDS
+              value: "8"
+            - name: INSECURE_SKIP_VERIFY
+              value: "false"
           livenessProbe:
-            httpGet:
-              path: /livez
-              port: 9100
-            initialDelaySeconds: 5
-            periodSeconds: 3
-            timeoutSeconds: 2
+            exec:
+              command:
+                - /bin/bash
+                - /shared/check-sidecar-health.sh
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
             failureThreshold: 2
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: shared-health
+              mountPath: /shared
 ---
 apiVersion: apps/v1
 kind: Deployment

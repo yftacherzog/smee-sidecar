@@ -2,7 +2,7 @@
 
 A sidecar container for implementing health checks and monitoring for
 [Smee](https://smee.io/) deployments. This sidecar provides active health checking
-to verify end to end functionally between the Smee server and a client serving a
+to verify end-to-end functionality between the Smee server and a client serving a
 specific channel.
 
 ## Overview
@@ -11,7 +11,7 @@ The smee-sidecar acts as an instrumentation and proxy layer between Smee clients
 downstream services, providing:
 
 - **End-to-end health checking** via round-trip webhook tests
-- **Process liveness monitoring** for Kubernetes probes
+- **File-based health monitoring** for Kubernetes probes
 - **Prometheus metrics** for observability
 - **Event relay** with monitoring capabilities
 
@@ -23,19 +23,22 @@ downstream services, providing:
 ├────────────────────┬────────────────────────────────────┤
 │   smee-client      │           smee-sidecar             │
 │                    │                                    │
-│                    │                                    │
-│ ┌─────────────────┐│ ┌─────────────────┐                │
-│ │                 ││ │ Relay Server    │                │
-│ │   Webhook       ││ │ :8080           │                │
-│ │   Events        ││ │                 │                │
-│ │                 ││ └─────────────────┘                │
-│ └─────────────────┘│ ┌─────────────────┐                │
-│                    │ │ Management      │                │
-│ Liveness: /healthz │ │ Server :9100    │                │
-│                    │ │                 │                │
-│                    │ │ /healthz        │ ← Readiness    │
-│                    │ │ /livez          │ ← Liveness     │
+│                    │ ┌─────────────────┐                │
+│ ┌─────────────────┐│ │ Relay Server    │                │
+│ │                 ││ │ :8080           │                │
+│ │   Webhook       ││ │                 │                │
+│ │   Events        ││ └─────────────────┘                │
+│ │                 ││ ┌─────────────────┐                │
+│ └─────────────────┘│ │ Management      │                │
+│                    │ │ Server :9100    │                │
+│ Liveness: script   │ │                 │                │
 │                    │ │ /metrics        │ ← Prometheus   │
+│                    │ └─────────────────┘                │
+│                    │ ┌─────────────────┐                │
+│                    │ │ Shared Volume   │                │
+│                    │ │ /shared/        │                │
+│                    │ │ - health scripts│                │
+│                    │ │ - status file   │                │
 │                    │ └─────────────────┘                │
 └────────────────────┴────────────────────────────────────┘
                              │
@@ -58,16 +61,12 @@ and a the smee-sidecar container alongside it, as above.
    downstream service.
 2. The sidecar inspects the events and forwards them to the downstream service, unless
    those are health check events.
-3. The sidecar exposes a /healthz endpoint that triggers an end to end test that:
+3. The sidecar runs a background health checker that periodically:
     1. Sends an event to the same server and channel the client subscribes to.
     2. Waits for the event to be forwarded by the client.
-    3. If the event arrives, returns success status on the call.
-    4. If timed out while waiting, return failure status.
-4. The client is configured with the sidecar /healthz endpoint as its liveness probe, so
-   the client restarts if the check fails continuously.
-5. The sidecar is configured with /livez endpoint as its liveness probe that verifies
-   that the server the sidecar is running is functional
-   ([more details](#failure-isolation)).
+    3. Writes the result (success/failure) to a shared file.
+4. Both containers use file-based liveness probes that check the shared health status,
+   avoiding HTTP dependencies and providing better failure isolation.
 
 ### Metrics
 
@@ -81,12 +80,15 @@ The sidecar exposes Prometheus metrics on `:9100/metrics`:
 
 ### Environment Variables
 
-|Variable                 |Required|Default|Description                              |
-|----------               |--------|-------|-----------                              |
-|`DOWNSTREAM_SERVICE_URL` |✅      | -     | Service to relay webhook events to      |
-|`SMEE_CHANNEL_URL`       |✅      | -     | Smee channel used by the client         |
-|`HEALTHZ_TIMEOUT_SECONDS`|❌      |`20`   | Timeout for end-to-end health checks    |
-|`INSECURE_SKIP_VERIFY`   |❌      |`false`| Skip TLS verification for health checks |
+|Variable                        |Required|Default                    |Description                              |
+|----------                      |--------|-------                    |-----------                              |
+|`DOWNSTREAM_SERVICE_URL`        |✅      | -                         | Service to relay webhook events to      |
+|`SMEE_CHANNEL_URL`              |✅      | -                         | Smee channel used by the client         |
+|`HEALTH_CHECK_TIMEOUT_SECONDS`  |❌      |`20`                       | Timeout for end-to-end health checks    |
+|`HEALTH_CHECK_INTERVAL_SECONDS` |❌      |`30`                       | Interval between background health checks|
+|`SHARED_VOLUME_PATH`            |❌      |`/shared`                  | Path to shared volume for health files  |
+|`HEALTH_FILE_PATH`              |❌      |`/shared/health-status.txt`| Path to health status file              |
+|`INSECURE_SKIP_VERIFY`          |❌      |`false`                    | Skip TLS verification for health checks |
 
 ### Example Configuration
 
@@ -96,8 +98,10 @@ env:
     value: "http://my-service:8080"
   - name: SMEE_CHANNEL_URL
     value: "http://smee-server/myawesomechannel"
-  - name: HEALTHZ_TIMEOUT_SECONDS
+  - name: HEALTH_CHECK_INTERVAL_SECONDS
     value: "30"
+  - name: HEALTH_CHECK_TIMEOUT_SECONDS
+    value: "20"
 ```
 
 ## Kubernetes Deployment
@@ -119,6 +123,9 @@ spec:
       labels:
         app: my-app
     spec:
+      volumes:
+        - name: shared-health
+          emptyDir: {}
       containers:
         # Main smee client container
         - name: smee-client
@@ -128,11 +135,13 @@ spec:
             - "https://smee.io/myawesomechannel"
             - "http://localhost:8080"
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 9100
-            initialDelaySeconds: 10
+            exec:
+              command: ["/bin/bash", "/shared/check-smee-health.sh"]
+            initialDelaySeconds: 20
             periodSeconds: 10
+          volumeMounts:
+            - name: shared-health
+              mountPath: /shared
 
         # Sidecar container
         - name: sidecar
@@ -148,11 +157,13 @@ spec:
             - name: SMEE_CHANNEL_URL
               value: "https://smee.io/myawesomechannel"
           livenessProbe:
-            httpGet:
-              path: /livez      # Simple process check
-              port: 9100
-            initialDelaySeconds: 5
+            exec:
+              command: ["/bin/bash", "/shared/check-sidecar-health.sh"]
+            initialDelaySeconds: 15
             periodSeconds: 10
+          volumeMounts:
+            - name: shared-health
+              mountPath: /shared
 
         # Your application container
         - name: my-app
@@ -163,24 +174,25 @@ spec:
 
 ### Failure Isolation
 
-Ideally, we could have had the same endpoint on the sidecar used for liveness probe in
-all containers (server, client, sidecar), but in cases the health check fails for
-reasons unrelated to the pod itself (e.g. the upstream Smee server is down), all
-containers on the pod can experience cascading restart loops, that will not allow them
-to be up at the same time to allow the health check to recover.
+The file-based health checking approach provides better failure isolation compared to
+HTTP-based probes:
 
-There are 2 ways to address that:
-1. Client deployments: use the **sidecar's** /healthz endpoint as liveness probe for the
-   client and the **sidecar's** /livez endpoint as liveness probe for the sidecar.
-2. Server deployments: Same as client, but we still need the sidecar's /healthz endpoint
-   configured as liveness probe for both the server and the client.
+1. **No cross-container HTTP dependencies**: Each container has its own liveness probe
+   script that reads from the shared health status file.
+2. **Independent failure modes**: The smee-client probe checks both file age and health
+   status, while the sidecar probe only checks if the process is updating the file.
+3. **Reduced restart cascades**: If health checks fail due to external issues (e.g.,
+   upstream Smee server down), only the client restarts while the sidecar continues
+   running and attempting health checks.
 
-   In this case, we should configure the probe on the server and the client so that
-   `failureThreshold` x `initialDelaySeconds` is longer than the max
-   backoff penalty on the cluster.
+However, for **server deployments** where both a Smee server and test client need to be
+monitored together, cascading restarts can still occur if both containers use health
+checks that depend on end-to-end functionality. To mitigate this:
 
-   This will allow the client and the server to be up at the same time and will allow
-   the health check to eventually pass when the upstream issue is resolved.
+- Configure liveness probes on both server and client with `failureThreshold` ×
+  `periodSeconds` longer than the cluster's maximum backoff penalty.
+- This ensures both containers can stay up simultaneously long enough for health checks
+  to recover when external dependencies become available again.
 
 ## Image Registry
 

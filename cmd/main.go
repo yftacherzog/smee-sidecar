@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,14 +13,31 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+//go:embed scripts/check-smee-health.sh
+var smeeHealthScript []byte
+
+//go:embed scripts/check-sidecar-health.sh
+var sidecarHealthScript []byte
+
+//go:embed scripts/check-file-age.sh
+var fileAgeScript []byte
+
+// HealthStatus represents the current health status
+type HealthStatus struct {
+	Status  string // "success" or "failure"
+	Message string
+}
 
 var (
 	forwardAttempts = prometheus.NewCounter(
@@ -76,39 +94,62 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// healthzHandler performs a single, synchronous end-to-end check.
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	// healthStatus will be 0 (failure) by default. It is set to 1 upon success.
-	// The defer statement ensures the metric is set only once when the function exits.
-	var healthStatus float64 = 0
-	defer func() {
-		health_check.Set(healthStatus)
-	}()
-
-	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
-	if smeeChannelURL == "" {
-		log.Println("Healthz Error: SMEE_CHANNEL_URL env var is not set.")
-		http.Error(w, "Sidecar not configured", http.StatusInternalServerError)
-		return
+// writeScriptsToVolume writes the embedded probe scripts to the shared volume
+func writeScriptsToVolume(sharedPath string) error {
+	scripts := map[string][]byte{
+		"check-smee-health.sh":    smeeHealthScript,
+		"check-sidecar-health.sh": sidecarHealthScript,
+		"check-file-age.sh":       fileAgeScript,
 	}
 
-	// Read timeout from environment variable, with a default of 20 seconds.
-	timeoutSeconds := 20
-	if timeoutStr := os.Getenv("HEALTHZ_TIMEOUT_SECONDS"); timeoutStr != "" {
-		if val, err := strconv.Atoi(timeoutStr); err == nil && val > 0 {
-			timeoutSeconds = val
-			log.Printf("Using custom healthz timeout: %d seconds", timeoutSeconds)
-		} else {
-			log.Printf("Invalid HEALTHZ_TIMEOUT_SECONDS value '%s'. Falling back to default of %d seconds.", timeoutStr, timeoutSeconds)
+	for filename, content := range scripts {
+		scriptPath := filepath.Join(sharedPath, filename)
+		if err := os.WriteFile(scriptPath, content, 0755); err != nil {
+			return fmt.Errorf("failed to write %s: %v", filename, err)
 		}
+
+		// Make script read-only to prevent accidental modification
+		if err := os.Chmod(scriptPath, 0555); err != nil {
+			return fmt.Errorf("failed to make %s read-only: %v", filename, err)
+		}
+
+		log.Printf("Wrote read-only probe script: %s", scriptPath)
+	}
+	return nil
+}
+
+// writeHealthStatus writes health status to file atomically
+func writeHealthStatus(status *HealthStatus, filePath string) error {
+	// Simple format with only fields used by probe scripts
+	content := fmt.Sprintf("status=%s\nmessage=%s\n",
+		status.Status,
+		status.Message,
+	)
+
+	// Atomic write: write to temp file, then rename
+	tmpPath := filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %v", err)
 	}
 
-	// The overall timeout for the probe to complete.
-	timeoutDuration := time.Duration(timeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		return fmt.Errorf("failed to rename temp file: %v", err)
+	}
+
+	return nil
+}
+
+// performHealthCheck executes a single end-to-end health check
+func performHealthCheck(smeeChannelURL string, timeoutSeconds int) *HealthStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
 	testID := uuid.New().String()
+	status := &HealthStatus{
+		Status:  "failure",
+		Message: "Health check failed",
+	}
+
 	payload := HealthCheckPayload{Type: "health-check", ID: testID}
 	payloadBytes, _ := json.Marshal(payload)
 
@@ -128,10 +169,11 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	// Create and send the POST request.
 	req, err := http.NewRequestWithContext(ctx, "POST", smeeChannelURL, bytes.NewBuffer(payloadBytes))
 	if err != nil {
-		http.Error(w, "Failed to create health check request", http.StatusInternalServerError)
-		return
+		status.Message = fmt.Sprintf("Failed to create request: %v", err)
+		return status
 	}
 	req.Header.Set("Content-Type", "application/json")
+
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY")},
@@ -139,48 +181,111 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err = client.Do(req); err != nil {
-		log.Printf("Healthz Error: could not post to Smee server: %v", err)
-		http.Error(w, "Failed to POST to Smee server", http.StatusServiceUnavailable)
-		return
+		status.Message = fmt.Sprintf("Failed to POST to smee server: %v", err)
+		return status
 	}
 
 	// Wait for the forwardHandler to receive the event, or for the timeout.
 	select {
 	case <-resultChan:
-		log.Println("Healthz check PASSED.")
-		// The check was successful, so we'll set the status to 1.
-		healthStatus = 1
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "OK")
+		status.Status = "success"
+		status.Message = "Health check completed successfully"
 	case <-ctx.Done():
-		log.Println("Healthz check FAILED: timed out waiting for event round-trip.")
-		http.Error(w, "Health check timed out", http.StatusServiceUnavailable)
+		status.Message = "Health check timed out waiting for event round-trip"
 	}
+
+	return status
 }
 
-// livezHandler performs a simple check to see if the process is running.
-// This can be used for a Kubernetes livenessProbe to ensure the HTTP server is responsive.
-func livezHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "alive")
+// runHealthChecker runs the background health checker
+func runHealthChecker(ctx context.Context, smeeChannelURL, healthFilePath string, intervalSeconds, timeoutSeconds int) {
+	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("Starting background health checker (interval: %ds, timeout: %ds)", intervalSeconds, timeoutSeconds)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Health checker stopped")
+			return
+		case <-ticker.C:
+			status := performHealthCheck(smeeChannelURL, timeoutSeconds)
+
+			if err := writeHealthStatus(status, healthFilePath); err != nil {
+				log.Printf("Failed to write health status: %v", err)
+			} else {
+				log.Printf("Health check completed: %s (%s)", status.Status, status.Message)
+			}
+
+			// Update Prometheus metric
+			if status.Status == "success" {
+				health_check.Set(1)
+			} else {
+				health_check.Set(0)
+			}
+		}
+	}
 }
 
 func main() {
 	log.Println("Starting Smee instrumentation sidecar...")
 
+	// Environment variables
 	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL")
 	if downstreamServiceURL == "" {
 		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL environment variable must be set.")
 	}
+
+	smeeChannelURL := os.Getenv("SMEE_CHANNEL_URL")
+	if smeeChannelURL == "" {
+		log.Fatal("FATAL: SMEE_CHANNEL_URL environment variable must be set.")
+	}
+
+	sharedPath := os.Getenv("SHARED_VOLUME_PATH")
+	if sharedPath == "" {
+		sharedPath = "/shared"
+	}
+
+	healthFilePath := os.Getenv("HEALTH_FILE_PATH")
+	if healthFilePath == "" {
+		healthFilePath = filepath.Join(sharedPath, "health-status.txt")
+	}
+
+	// Parse configuration
+	healthCheckInterval := 30
+	if intervalStr := os.Getenv("HEALTH_CHECK_INTERVAL_SECONDS"); intervalStr != "" {
+		if val, err := strconv.Atoi(intervalStr); err == nil && val > 0 {
+			healthCheckInterval = val
+		}
+	}
+
+	healthCheckTimeout := 20
+	if timeoutStr := os.Getenv("HEALTH_CHECK_TIMEOUT_SECONDS"); timeoutStr != "" {
+		if val, err := strconv.Atoi(timeoutStr); err == nil && val > 0 {
+			healthCheckTimeout = val
+		}
+	}
+
+	// Write probe scripts to shared volume
+	if err := writeScriptsToVolume(sharedPath); err != nil {
+		log.Fatalf("FATAL: Failed to write probe scripts: %v", err)
+	}
+
 	downstreamURL, err := url.Parse(downstreamServiceURL)
 	if err != nil {
 		log.Fatalf("FATAL: Could not parse DOWNSTREAM_SERVICE_URL: %v", err)
 	}
 	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
 
-	// Register both metrics with Prometheus.
+	// Register metrics with Prometheus.
 	prometheus.MustRegister(forwardAttempts)
 	prometheus.MustRegister(health_check)
+
+	// Start background health checker
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runHealthChecker(ctx, smeeChannelURL, healthFilePath, healthCheckInterval, healthCheckTimeout)
 
 	// --- Relay Server (on port 8080) ---
 	relayMux := http.NewServeMux()
@@ -195,10 +300,8 @@ func main() {
 	// --- Management Server (on port 9100) ---
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
-	mgmtMux.HandleFunc("/healthz", healthzHandler)
-	mgmtMux.HandleFunc("/livez", livezHandler)
 	go func() {
-		log.Println("Management server (metrics, healthz, livez) listening on :9100")
+		log.Println("Management server (metrics) listening on :9100")
 		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
 			log.Fatalf("FATAL: Management server failed: %v", err)
 		}

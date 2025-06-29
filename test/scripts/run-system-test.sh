@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script runs a system test to verify event relaying, liveness probe recovery,
-# and the accuracy of the health_check metric.
+# and the accuracy of the health_check metric with file-based health checking.
 
 set -ex
 
@@ -53,6 +53,72 @@ get_health_check_metric() {
   fi
 }
 
+# This function checks the health status file directly from the pod
+# to verify the file-based health checking is working correctly.
+get_health_status_from_file() {
+  local pod_name
+  pod_name=$(kubectl get pods -l ${SIDECAR_POD_LABEL} -o jsonpath='{.items[0].metadata.name}')
+  if [ -z "${pod_name}" ]; then
+    echo "Error: Could not find sidecar pod." >&2
+    return 1
+  fi
+
+  echo "Reading health status file from pod: ${pod_name}" >&2
+
+  # Try to read the health status file from the shared volume
+  local health_content
+  health_content=$(kubectl exec "${pod_name}" -c sidecar -- cat /shared/health-status.txt 2>/dev/null || echo "")
+  
+  if [ -z "${health_content}" ]; then
+    echo "Warning: Could not read health status file. Assuming failure." >&2
+    echo "failure"
+  else
+    # Parse the status from the file (format: status=success or status=failure)
+    local status
+    status=$(echo "${health_content}" | grep '^status=' | cut -d'=' -f2)
+    echo "${status:-failure}"
+  fi
+}
+
+# This function verifies that the probe scripts exist and are executable
+verify_probe_scripts() {
+  local pod_name
+  pod_name=$(kubectl get pods -l ${SIDECAR_POD_LABEL} -o jsonpath='{.items[0].metadata.name}')
+  if [ -z "${pod_name}" ]; then
+    echo "Error: Could not find sidecar pod." >&2
+    return 1
+  fi
+
+  echo "Verifying probe scripts exist and are executable..." >&2
+
+  # Check smee health script
+  if ! kubectl exec "${pod_name}" -c sidecar -- test -x /shared/check-smee-health.sh; then
+    echo "Error: Smee health script not found or not executable." >&2
+    return 1
+  fi
+
+  # Check sidecar health script  
+  if ! kubectl exec "${pod_name}" -c sidecar -- test -x /shared/check-sidecar-health.sh; then
+    echo "Error: Sidecar health script not found or not executable." >&2
+    return 1
+  fi
+
+  # Check file age utility script
+  if ! kubectl exec "${pod_name}" -c sidecar -- test -x /shared/check-file-age.sh; then
+    echo "Error: File age utility script not found or not executable." >&2
+    return 1
+  fi
+
+  echo "Success: All probe scripts are present and executable." >&2
+}
+
+echo "--- Phase 0: Verify File-Based Health Setup ---"
+echo "Waiting for pod to be ready and scripts to be written..."
+kubectl wait --for=condition=Ready pod -l ${SIDECAR_POD_LABEL} --timeout=60s
+sleep 5
+
+verify_probe_scripts
+echo "File-based health checking setup verified."
 
 echo "--- Phase 1.1: Verify Initial Health ---"
 
@@ -65,15 +131,25 @@ if [ "${INITIAL_RESTARTS}" -ne "0" ]; then
 fi
 echo "Sidecar is running with 0 restarts, as expected."
 
-echo "--- Phase 1.2: Verify Initial Metric is Healthy ---"
-echo "Wait for the initial delay of the liveness probe to pass."
-sleep 10
+echo "--- Phase 1.2: Verify Initial Health Status ---"
+echo "Wait for the background health checker to complete initial checks..."
+sleep 15
+
+# Check both the metric and the file-based status
 METRIC=$(get_health_check_metric)
+FILE_STATUS=$(get_health_status_from_file)
+
 if [ "${METRIC}" != "1" ]; then
   echo "Error: Initial health_check metric was ${METRIC}, expected 1."
   exit 1
 fi
-echo "Success: Initial health_check metric is 1."
+
+if [ "${FILE_STATUS}" != "success" ]; then
+  echo "Error: Initial health status file shows ${FILE_STATUS}, expected success."
+  exit 1
+fi
+
+echo "Success: Initial health_check metric is 1 and file status is success."
 
 echo "--- Phase 1.3: Verify Event Relaying ---"
 TEST_MESSAGE="webhook-test-$(date +%s)"
@@ -117,30 +193,33 @@ kubectl scale ${SMEE_SERVER_DEPLOYMENT} --replicas=0
 echo "Smee server scaled down to 0 replicas."
 
 
-echo "--- Phase 3.1: Verify Metric Reflects Unhealthy State ---"
-echo "Waiting for healthz probe to fail and update the metric to 0..."
+echo "--- Phase 3.1: Verify Health Status Reflects Unhealthy State ---"
+echo "Waiting for background health checker to detect failure and update status..."
 ATTEMPTS=0
-MAX_ATTEMPTS=10 # 10 attempts * 6s sleep = 60s timeout
+MAX_ATTEMPTS=15 # 15 attempts * 8s sleep = 120s timeout (health check interval is 10s)
 while true; do
   METRIC=$(get_health_check_metric)
-  if [ "${METRIC}" == "0" ]; then
-    echo "Success: health_check metric is now 0, indicating an unhealthy state."
+  FILE_STATUS=$(get_health_status_from_file)
+  
+  if [ "${METRIC}" == "0" ] && [ "${FILE_STATUS}" == "failure" ]; then
+    echo "Success: health_check metric is now 0 and file status is failure, indicating an unhealthy state."
     break
   fi
   ATTEMPTS=$((ATTEMPTS + 1))
   if [ "${ATTEMPTS}" -gt "${MAX_ATTEMPTS}" ]; then
-    echo "Error: Timed out waiting for health_check metric to become 0."
+    echo "Error: Timed out waiting for health status to become unhealthy."
+    echo "Current metric: ${METRIC}, file status: ${FILE_STATUS}"
     exit 1
   fi
-  echo "Current health_check metric is ${METRIC}. Waiting..."
-  sleep 6
+  echo "Current health_check metric is ${METRIC}, file status is ${FILE_STATUS}. Waiting..."
+  sleep 8
 done
 
 
 echo "--- Phase 3.2: Verify Sidecar Restarts due to Liveness Probe ---"
 echo "Waiting for liveness probe to fail and for Kubernetes to restart the sidecar..."
 ATTEMPTS=0
-MAX_ATTEMPTS=30 # 30 attempts * 3s sleep = 90s timeout
+MAX_ATTEMPTS=30 # 30 attempts * 5s sleep = 150s timeout
 while true; do
   # It's possible for the pod name to change if the pod gets recreated, so we fetch it again.
   SIDECAR_POD_NAME=$(kubectl get pods -l ${SIDECAR_POD_LABEL} -o jsonpath='{.items[0].metadata.name}')
@@ -153,10 +232,12 @@ while true; do
   if [ "${ATTEMPTS}" -gt "${MAX_ATTEMPTS}" ]; then
     echo "Error: Timed out waiting for sidecar to restart."
     echo "Final restart count: ${CURRENT_RESTARTS}"
+    # Debug: show recent events and pod status
+    kubectl describe pod ${SIDECAR_POD_NAME}
     exit 1
   fi
   echo "Current restart count is ${CURRENT_RESTARTS}. Waiting..."
-  sleep 3
+  sleep 5
 done
 
 
@@ -167,23 +248,26 @@ kubectl wait --for=condition=Available ${SMEE_SERVER_DEPLOYMENT} --timeout=60s
 echo "Smee server is available again."
 
 
-echo "--- Phase 5.1: Verify Sidecar Recovery via Metric ---"
-echo "Waiting for the sidecar to recover and the health_check metric to become 1..."
+echo "--- Phase 5.1: Verify Sidecar Recovery via Health Status ---"
+echo "Waiting for the sidecar to recover and the health status to become healthy..."
 ATTEMPTS=0
-MAX_ATTEMPTS=10 # 10 attempts * 6s sleep = 60s timeout
+MAX_ATTEMPTS=15 # 15 attempts * 8s sleep = 120s timeout
 while true; do
   METRIC=$(get_health_check_metric)
-  if [ "${METRIC}" == "1" ]; then
-    echo "Success: health_check metric is 1 again. Sidecar has recovered."
+  FILE_STATUS=$(get_health_status_from_file)
+  
+  if [ "${METRIC}" == "1" ] && [ "${FILE_STATUS}" == "success" ]; then
+    echo "Success: health_check metric is 1 and file status is success. Sidecar has recovered."
     break
   fi
   ATTEMPTS=$((ATTEMPTS + 1))
   if [ "${ATTEMPTS}" -gt "${MAX_ATTEMPTS}" ]; then
-    echo "Error: Timed out waiting for sidecar to recover and metric to become 1."
+    echo "Error: Timed out waiting for sidecar to recover."
+    echo "Current metric: ${METRIC}, file status: ${FILE_STATUS}"
     exit 1
   fi
-  echo "Current health_check metric is ${METRIC}. Waiting for recovery..."
-  sleep 6
+  echo "Current health_check metric is ${METRIC}, file status is ${FILE_STATUS}. Waiting for recovery..."
+  sleep 8
 done
 
 
@@ -194,8 +278,8 @@ kubectl wait --for=condition=Available ${SIDECAR_DEPLOYMENT} --timeout=60s
 # Get the latest pod name and restart count after recovery.
 SIDECAR_POD_NAME=$(kubectl get pods -l ${SIDECAR_POD_LABEL} -o jsonpath='{.items[0].metadata.name}')
 RESTARTS_AFTER_RECOVERY=$(kubectl get pod ${SIDECAR_POD_NAME} -o jsonpath='{.status.containerStatuses[0].restartCount}')
-echo "Verifying stability. Restart count is ${RESTARTS_AFTER_RECOVERY}. Waiting 15 seconds..."
-sleep 15
+echo "Verifying stability. Restart count is ${RESTARTS_AFTER_RECOVERY}. Waiting 20 seconds..."
+sleep 20
 STABLE_RESTARTS=$(kubectl get pod ${SIDECAR_POD_NAME} -o jsonpath='{.status.containerStatuses[0].restartCount}')
 if [ "${STABLE_RESTARTS}" -ne "${RESTARTS_AFTER_RECOVERY}" ]; then
   echo "Error: Sidecar is unstable. Restart count increased from ${RESTARTS_AFTER_RECOVERY} to ${STABLE_RESTARTS}."
@@ -203,4 +287,21 @@ if [ "${STABLE_RESTARTS}" -ne "${RESTARTS_AFTER_RECOVERY}" ]; then
 fi
 echo "Sidecar has recovered and is stable with ${STABLE_RESTARTS} restart(s)."
 
+echo "--- Phase 5.3: Verify File-Based Health Checking is Working ---"
+echo "Final verification that file-based health checking is operational..."
+verify_probe_scripts
+
+# Verify the health status file is being updated regularly
+HEALTH_FILE_TIME_1=$(kubectl exec "${SIDECAR_POD_NAME}" -c sidecar -- stat -c %Y /shared/health-status.txt)
+sleep 12  # Wait longer than health check interval (10s)
+HEALTH_FILE_TIME_2=$(kubectl exec "${SIDECAR_POD_NAME}" -c sidecar -- stat -c %Y /shared/health-status.txt)
+
+if [ "${HEALTH_FILE_TIME_2}" -gt "${HEALTH_FILE_TIME_1}" ]; then
+  echo "Success: Health status file is being updated regularly by background health checker."
+else
+  echo "Warning: Health status file may not be updating regularly."
+  echo "Time 1: ${HEALTH_FILE_TIME_1}, Time 2: ${HEALTH_FILE_TIME_2}"
+fi
+
 echo "--- System Test PASSED ---"
+echo "File-based health checking system is working correctly!"

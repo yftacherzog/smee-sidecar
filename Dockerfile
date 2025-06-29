@@ -15,6 +15,7 @@ RUN go mod download
 
 # Copy the rest of the source code
 COPY cmd/main.go cmd/main.go
+COPY cmd/scripts/ cmd/scripts/
 
 # Build the binary with flags for a small, static executable
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o /opt/app-root/smee-sidecar cmd/main.go
