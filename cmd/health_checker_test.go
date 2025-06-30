@@ -156,6 +156,54 @@ var _ = Describe("Health Checker", func() {
 			Expect(string(content)).To(ContainSubstring("#!/bin/bash"))
 			Expect(string(content)).To(ContainSubstring("health-status"))
 		})
+
+		It("should handle overwriting existing read-only scripts", func() {
+			// First call to create the scripts
+			err := writeScriptsToVolume(tempDir)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify scripts exist and are read-only
+			smeeScriptPath := filepath.Join(tempDir, "check-smee-health.sh")
+			sidecarScriptPath := filepath.Join(tempDir, "check-sidecar-health.sh")
+			fileAgeScriptPath := filepath.Join(tempDir, "check-file-age.sh")
+
+			smeeInfo, err := os.Stat(smeeScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(smeeInfo.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			sidecarInfo, err := os.Stat(sidecarScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sidecarInfo.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			fileAgeInfo, err := os.Stat(fileAgeScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fileAgeInfo.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			// Second call should succeed even with read-only files
+			// This simulates what happens when a container restarts and tries to recreate scripts
+			err = writeScriptsToVolume(tempDir)
+			Expect(err).NotTo(HaveOccurred(),
+				"Second call to writeScriptsToVolume should succeed even with existing read-only files")
+
+			// Verify scripts are still readable and executable after overwrite
+			smeeInfo2, err := os.Stat(smeeScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(smeeInfo2.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			sidecarInfo2, err := os.Stat(sidecarScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sidecarInfo2.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			fileAgeInfo2, err := os.Stat(fileAgeScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fileAgeInfo2.Mode() & 0777).To(Equal(os.FileMode(0555)))
+
+			// Verify content is still valid
+			content, err := os.ReadFile(smeeScriptPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring("#!/bin/bash"))
+			Expect(string(content)).To(ContainSubstring("health-status"))
+		})
 	})
 
 	Describe("performHealthCheck", func() {

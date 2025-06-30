@@ -104,6 +104,15 @@ func writeScriptsToVolume(sharedPath string) error {
 
 	for filename, content := range scripts {
 		scriptPath := filepath.Join(sharedPath, filename)
+
+		// Check if file exists and make it writable before overwriting
+		// This handles container restarts where the volume persists with read-only files
+		if _, err := os.Stat(scriptPath); err == nil {
+			if err := os.Chmod(scriptPath, 0755); err != nil {
+				return fmt.Errorf("failed to make %s writable: %v", filename, err)
+			}
+		}
+
 		if err := os.WriteFile(scriptPath, content, 0755); err != nil {
 			return fmt.Errorf("failed to write %s: %v", filename, err)
 		}
