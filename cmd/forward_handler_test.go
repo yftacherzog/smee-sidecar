@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -37,10 +35,8 @@ var _ = Describe("forwardHandler", func() {
 			w.Write([]byte("downstream response"))
 		}))
 
-		// Set up the proxy to point to our mock downstream
-		downstreamURL, err := url.Parse(mockDownstream.URL)
-		Expect(err).NotTo(HaveOccurred())
-		proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
+		// Set the global downstream service URL for per-request proxy creation
+		downstreamServiceURL = mockDownstream.URL
 
 		// Reset global state
 		mutex.Lock()
@@ -229,6 +225,25 @@ var _ = Describe("forwardHandler", func() {
 
 			Expect(recorder.Code).To(Equal(http.StatusInternalServerError))
 			Expect(recorder.Body.String()).To(ContainSubstring("cannot read request body"))
+		})
+
+		It("should handle proxy creation errors", func() {
+			// Set an invalid downstream URL
+			originalURL := downstreamServiceURL
+			downstreamServiceURL = "://invalid-url"
+
+			payload := `{"type": "regular-event", "data": "some data"}`
+			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
+			Expect(err).NotTo(HaveOccurred())
+			request.Header.Set("Content-Type", "application/json")
+
+			forwardHandler(recorder, request)
+
+			Expect(recorder.Code).To(Equal(http.StatusInternalServerError))
+			Expect(recorder.Body.String()).To(ContainSubstring("failed to create proxy"))
+
+			// Restore the original URL
+			downstreamServiceURL = originalURL
 		})
 	})
 

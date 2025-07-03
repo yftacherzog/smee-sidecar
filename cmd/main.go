@@ -57,12 +57,23 @@ var (
 	// and the VALUE is a channel that the handler will wait on.
 	healthChecks = make(map[string]chan bool)
 	mutex        = &sync.Mutex{}
-	proxy        *httputil.ReverseProxy
+	// Global downstream service URL for per-request proxy creation
+	downstreamServiceURL string
 )
 
 type HealthCheckPayload struct {
 	Type string `json:"type"`
 	ID   string `json:"id"`
+}
+
+// createProxy creates a fresh reverse proxy for each request to prevent memory accumulation
+func createProxy(downstreamURL string) *httputil.ReverseProxy {
+	parsedURL, err := url.Parse(downstreamURL)
+	if err != nil {
+		log.Printf("ERROR: Could not parse downstream URL %s: %v", downstreamURL, err)
+		return nil
+	}
+	return httputil.NewSingleHostReverseProxy(parsedURL)
 }
 
 // forwardHandler needs to find the correct channel to signal success.
@@ -91,6 +102,11 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	forwardAttempts.Inc()
 	r.Body = io.NopCloser(bytes.NewReader(body))
+	proxy := createProxy(downstreamServiceURL)
+	if proxy == nil {
+		http.Error(w, "internal server error: failed to create proxy", http.StatusInternalServerError)
+		return
+	}
 	proxy.ServeHTTP(w, r)
 }
 
@@ -241,7 +257,7 @@ func main() {
 	log.Println("Starting Smee instrumentation sidecar...")
 
 	// Environment variables
-	downstreamServiceURL := os.Getenv("DOWNSTREAM_SERVICE_URL")
+	downstreamServiceURL = os.Getenv("DOWNSTREAM_SERVICE_URL")
 	if downstreamServiceURL == "" {
 		log.Fatal("FATAL: DOWNSTREAM_SERVICE_URL environment variable must be set.")
 	}
@@ -280,12 +296,6 @@ func main() {
 	if err := writeScriptsToVolume(sharedPath); err != nil {
 		log.Fatalf("FATAL: Failed to write probe scripts: %v", err)
 	}
-
-	downstreamURL, err := url.Parse(downstreamServiceURL)
-	if err != nil {
-		log.Fatalf("FATAL: Could not parse DOWNSTREAM_SERVICE_URL: %v", err)
-	}
-	proxy = httputil.NewSingleHostReverseProxy(downstreamURL)
 
 	// Register metrics with Prometheus.
 	prometheus.MustRegister(forwardAttempts)
