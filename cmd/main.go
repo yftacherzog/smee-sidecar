@@ -73,7 +73,21 @@ func createProxy(downstreamURL string) *httputil.ReverseProxy {
 		log.Printf("ERROR: Could not parse downstream URL %s: %v", downstreamURL, err)
 		return nil
 	}
-	return httputil.NewSingleHostReverseProxy(parsedURL)
+	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
+
+	// Set custom transport to avoid using shared http.DefaultTransport
+	proxy.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY"),
+		},
+		// Disable connection pooling to prevent memory accumulation
+		DisableKeepAlives:   true,
+		MaxIdleConns:        0,
+		MaxIdleConnsPerHost: 0,
+		IdleConnTimeout:     1 * time.Second,
+	}
+
+	return proxy
 }
 
 // forwardHandler needs to find the correct channel to signal success.
