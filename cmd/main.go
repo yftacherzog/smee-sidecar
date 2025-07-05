@@ -215,7 +215,14 @@ func performHealthCheck(smeeChannelURL string, timeoutSeconds int) *HealthStatus
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY")},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY"),
+			},
+			// Disable connection pooling to prevent memory accumulation
+			DisableKeepAlives:   true,
+			MaxIdleConns:        0,
+			MaxIdleConnsPerHost: 0,
+			IdleConnTimeout:     1 * time.Second,
 		},
 	}
 
