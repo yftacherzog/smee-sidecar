@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -59,6 +60,15 @@ var (
 	mutex        = &sync.Mutex{}
 	// Global downstream service URL for per-request proxy creation
 	downstreamServiceURL string
+
+	// Shared HTTP clients to prevent resource accumulation
+	healthCheckClient *http.Client
+	proxyInstance     *httputil.ReverseProxy
+
+	// Thread-safe initialization
+	healthCheckOnce sync.Once
+	proxyOnce       sync.Once
+	proxyError      error
 )
 
 type HealthCheckPayload struct {
@@ -66,61 +76,82 @@ type HealthCheckPayload struct {
 	ID   string `json:"id"`
 }
 
-// createProxy creates a fresh reverse proxy for each request to prevent memory accumulation
-func createProxy(downstreamURL string) *httputil.ReverseProxy {
-	parsedURL, err := url.Parse(downstreamURL)
-	if err != nil {
-		log.Printf("ERROR: Could not parse downstream URL %s: %v", downstreamURL, err)
-		return nil
-	}
-	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
-
-	// Set custom transport to avoid using shared http.DefaultTransport
-	proxy.Transport = &http.Transport{
+// createOptimizedTransport creates a transport with proper resource limits
+func createOptimizedTransport() *http.Transport {
+	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY"),
 		},
-		// Disable connection pooling to prevent memory accumulation
-		DisableKeepAlives:   true,
-		MaxIdleConns:        0,
-		MaxIdleConnsPerHost: 0,
-		IdleConnTimeout:     1 * time.Second,
+		// Aggressive connection pooling disable to prevent memory accumulation
+		DisableKeepAlives:     true,
+		MaxIdleConns:          0,
+		MaxIdleConnsPerHost:   0,
+		MaxConnsPerHost:       1, // Limit concurrent connections
+		IdleConnTimeout:       1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Force connection closure
+		DisableCompression: true,
 	}
+}
 
-	return proxy
+// getHealthCheckClient returns the shared health check client, creating it lazily if needed
+func getHealthCheckClient() *http.Client {
+	healthCheckOnce.Do(func() {
+		healthCheckClient = &http.Client{
+			Transport: createOptimizedTransport(),
+			Timeout:   30 * time.Second,
+		}
+	})
+	return healthCheckClient
+}
+
+// getProxyInstance returns the shared proxy instance, creating it lazily if needed
+func getProxyInstance() (*httputil.ReverseProxy, error) {
+	proxyOnce.Do(func() {
+		parsedURL, err := url.Parse(downstreamServiceURL)
+		if err != nil {
+			proxyError = fmt.Errorf("could not parse downstream URL %s: %v", downstreamServiceURL, err)
+			return
+		}
+		proxyInstance = httputil.NewSingleHostReverseProxy(parsedURL)
+		proxyInstance.Transport = createOptimizedTransport()
+	})
+	return proxyInstance, proxyError
 }
 
 // forwardHandler needs to find the correct channel to signal success.
 func forwardHandler(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "cannot read request body", http.StatusInternalServerError)
+	// Check for health check header first (fast path)
+	if healthCheckID := r.Header.Get("X-Health-Check-ID"); healthCheckID != "" {
+		mutex.Lock()
+		resultChan, exists := healthChecks[healthCheckID]
+		mutex.Unlock()
+
+		if exists {
+			// Signal that we received the health check event
+			select {
+			case resultChan <- true:
+			default:
+				// Channel is full or closed, ignore
+			}
+		}
+
+		w.WriteHeader(http.StatusOK)
 		return
 	}
-	defer r.Body.Close()
 
-	var healthCheck HealthCheckPayload
-	if r.Header.Get("Content-Type") == "application/json" {
-		if json.Unmarshal(body, &healthCheck) == nil && healthCheck.Type == "health-check" {
-			mutex.Lock()
-			// Find the waiting channel for this specific ID and signal it.
-			if resultChan, ok := healthChecks[healthCheck.ID]; ok {
-				log.Printf("Health Check: Intercepted health check event with ID: %s", healthCheck.ID)
-				resultChan <- true
-				delete(healthChecks, healthCheck.ID) // Clean up the map
-			}
-			mutex.Unlock()
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-	}
-	forwardAttempts.Inc()
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	proxy := createProxy(downstreamServiceURL)
-	if proxy == nil {
+	// Forward real webhook events directly - no need to read body into memory
+
+	// Use the shared proxy instance
+	proxy, err := getProxyInstance()
+	if err != nil {
 		http.Error(w, "internal server error: failed to create proxy", http.StatusInternalServerError)
 		return
 	}
+
+	// Only count actual forwarding attempts (after successful proxy creation)
+	forwardAttempts.Inc()
 	proxy.ServeHTTP(w, r)
 }
 
@@ -211,25 +242,31 @@ func performHealthCheck(smeeChannelURL string, timeoutSeconds int) *HealthStatus
 		status.Message = fmt.Sprintf("Failed to create request: %v", err)
 		return status
 	}
+
+	// Send health check ID in header for fast detection AND JSON body for server compatibility
+	req.Header.Set("X-Health-Check-ID", testID)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY"),
-			},
-			// Disable connection pooling to prevent memory accumulation
-			DisableKeepAlives:   true,
-			MaxIdleConns:        0,
-			MaxIdleConnsPerHost: 0,
-			IdleConnTimeout:     1 * time.Second,
-		},
-	}
+	// Ensure connection is closed after use
+	req.Close = true
 
-	if _, err = client.Do(req); err != nil {
+	// Use the shared HTTP client
+	client := getHealthCheckClient()
+
+	resp, err := client.Do(req)
+	if err != nil {
 		status.Message = fmt.Sprintf("Failed to POST to smee server: %v", err)
 		return status
 	}
+
+	// Always close response body to prevent resource leaks
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			// Drain and close the body to ensure resources are freed
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
 
 	// Wait for the forwardHandler to receive the event, or for the timeout.
 	select {
@@ -313,6 +350,11 @@ func main() {
 		}
 	}
 
+	// Check if pprof endpoints should be enabled (disabled by default for security)
+	enablePprof := "true" == os.Getenv("ENABLE_PPROF")
+
+	// HTTP clients will be initialized lazily when first needed
+
 	// Write probe scripts to shared volume
 	if err := writeScriptsToVolume(sharedPath); err != nil {
 		log.Fatalf("FATAL: Failed to write probe scripts: %v", err)
@@ -340,8 +382,30 @@ func main() {
 	// --- Management Server (on port 9100) ---
 	mgmtMux := http.NewServeMux()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
+
+	// Add pprof endpoints for memory profiling
+	if enablePprof {
+		log.Println("Enabling pprof endpoints for debugging")
+		mgmtMux.HandleFunc("/debug/pprof/", pprof.Index)
+		mgmtMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mgmtMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mgmtMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mgmtMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		mgmtMux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+		mgmtMux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+		mgmtMux.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
+		mgmtMux.Handle("/debug/pprof/block", pprof.Handler("block"))
+		mgmtMux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+	} else {
+		log.Println("pprof endpoints disabled (set ENABLE_PPROF=true to enable)")
+	}
+
 	go func() {
-		log.Println("Management server (metrics) listening on :9100")
+		if enablePprof {
+			log.Println("Management server (metrics & pprof) listening on :9100")
+		} else {
+			log.Println("Management server (metrics) listening on :9100")
+		}
 		if err := http.ListenAndServe(":9100", mgmtMux); err != nil {
 			log.Fatalf("FATAL: Management server failed: %v", err)
 		}

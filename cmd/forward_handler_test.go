@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -42,6 +44,13 @@ var _ = Describe("forwardHandler", func() {
 		mutex.Lock()
 		healthChecks = make(map[string]chan bool)
 		mutex.Unlock()
+
+		// Reset HTTP clients for each test
+		healthCheckClient = nil
+		proxyInstance = nil
+		healthCheckOnce = sync.Once{}
+		proxyOnce = sync.Once{}
+		proxyError = nil
 
 		// Re-create the counter for each test
 		forwardAttempts = prometheus.NewCounter(
@@ -121,7 +130,7 @@ var _ = Describe("forwardHandler", func() {
 	})
 
 	Describe("handling health check events", func() {
-		It("should intercept health check events and signal waiting channel", func() {
+		It("should intercept health check events using header-based detection", func() {
 			testID := "test-health-check-123"
 
 			// Set up a waiting channel for this health check
@@ -130,15 +139,11 @@ var _ = Describe("forwardHandler", func() {
 			healthChecks[testID] = resultChan
 			mutex.Unlock()
 
-			payload := HealthCheckPayload{
-				Type: "health-check",
-				ID:   testID,
-			}
-			payloadBytes, err := json.Marshal(payload)
+			// Use header-based approach for health check detection
+			payload := fmt.Sprintf(`{"type": "health-check", "id": "%s"}`, testID)
+			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
 			Expect(err).NotTo(HaveOccurred())
-
-			request, err := http.NewRequest("POST", "/", bytes.NewBuffer(payloadBytes))
-			Expect(err).NotTo(HaveOccurred())
+			request.Header.Set("X-Health-Check-ID", testID)
 			request.Header.Set("Content-Type", "application/json")
 
 			forwardHandler(recorder, request)
@@ -149,11 +154,14 @@ var _ = Describe("forwardHandler", func() {
 			// Verify the channel was signaled
 			Eventually(resultChan).Should(Receive(Equal(true)))
 
-			// Verify the health check was cleaned up from the map
+			// Verify the health check is still in the map (cleanup happens in
+			// performHealthCheck, not forwardHandler)
 			mutex.Lock()
 			_, exists := healthChecks[testID]
+			// Clean up for the test
+			delete(healthChecks, testID)
 			mutex.Unlock()
-			Expect(exists).To(BeFalse())
+			Expect(exists).To(BeTrue())
 
 			// Verify no downstream request was made
 			requestMutex.Lock()
@@ -167,15 +175,11 @@ var _ = Describe("forwardHandler", func() {
 		It("should handle health check events when no channel is waiting", func() {
 			testID := "unknown-health-check-456"
 
-			payload := HealthCheckPayload{
-				Type: "health-check",
-				ID:   testID,
-			}
-			payloadBytes, err := json.Marshal(payload)
+			// Use header-based approach
+			payload := fmt.Sprintf(`{"type": "health-check", "id": "%s"}`, testID)
+			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
 			Expect(err).NotTo(HaveOccurred())
-
-			request, err := http.NewRequest("POST", "/", bytes.NewBuffer(payloadBytes))
-			Expect(err).NotTo(HaveOccurred())
+			request.Header.Set("X-Health-Check-ID", testID)
 			request.Header.Set("Content-Type", "application/json")
 
 			forwardHandler(recorder, request)
@@ -192,15 +196,39 @@ var _ = Describe("forwardHandler", func() {
 			Expect(testutil.ToFloat64(forwardAttempts)).To(Equal(0.0))
 		})
 
-		It("should handle malformed JSON gracefully", func() {
+		It("should forward health check events without header as regular events", func() {
+			// Health check JSON without header should be treated as regular event
+			payload := `{"type": "health-check", "id": "test-123"}`
+			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
+			Expect(err).NotTo(HaveOccurred())
+			request.Header.Set("Content-Type", "application/json")
+			// NOTE: No X-Health-Check-ID header set
+
+			forwardHandler(recorder, request)
+
+			// Should forward to downstream since no header present
+			Expect(recorder.Code).To(Equal(http.StatusOK))
+			Expect(recorder.Body.String()).To(Equal("downstream response"))
+
+			// Verify the request was forwarded to downstream
+			requestMutex.Lock()
+			Expect(len(downstreamRequests)).To(Equal(1))
+			requestMutex.Unlock()
+
+			// Verify the counter was incremented
+			Expect(testutil.ToFloat64(forwardAttempts)).To(Equal(1.0))
+		})
+
+		It("should forward malformed JSON as regular events", func() {
 			payload := `{"type": "health-check", "id": "test-123"` // Missing closing brace
 			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
 			Expect(err).NotTo(HaveOccurred())
 			request.Header.Set("Content-Type", "application/json")
+			// NOTE: No X-Health-Check-ID header set
 
 			forwardHandler(recorder, request)
 
-			// Should forward to downstream since JSON parsing failed
+			// Should forward to downstream since no header present
 			Expect(recorder.Code).To(Equal(http.StatusOK))
 			Expect(recorder.Body.String()).To(Equal("downstream response"))
 
@@ -215,18 +243,6 @@ var _ = Describe("forwardHandler", func() {
 	})
 
 	Describe("error handling", func() {
-		It("should handle request body read errors", func() {
-			// Create a request with a body that will cause an error when read
-			request, err := http.NewRequest("POST", "/", nil)
-			Expect(err).NotTo(HaveOccurred())
-			request.Body = &errorReader{}
-
-			forwardHandler(recorder, request)
-
-			Expect(recorder.Code).To(Equal(http.StatusInternalServerError))
-			Expect(recorder.Body.String()).To(ContainSubstring("cannot read request body"))
-		})
-
 		It("should handle proxy creation errors", func() {
 			// Set an invalid downstream URL
 			originalURL := downstreamServiceURL
@@ -268,15 +284,11 @@ var _ = Describe("forwardHandler", func() {
 				go func(index int) {
 					defer func() { done <- true }()
 
-					payload := HealthCheckPayload{
-						Type: "health-check",
-						ID:   testIDs[index],
-					}
-					payloadBytes, err := json.Marshal(payload)
+					// Use BOTH headers and JSON body approach for optimal performance + compatibility
+					payload := fmt.Sprintf(`{"type": "health-check", "id": "%s"}`, testIDs[index])
+					request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
 					Expect(err).NotTo(HaveOccurred())
-
-					request, err := http.NewRequest("POST", "/", bytes.NewBuffer(payloadBytes))
-					Expect(err).NotTo(HaveOccurred())
+					request.Header.Set("X-Health-Check-ID", testIDs[index])
 					request.Header.Set("Content-Type", "application/json")
 
 					recorder := httptest.NewRecorder()
@@ -296,21 +308,63 @@ var _ = Describe("forwardHandler", func() {
 				Eventually(resultChans[i]).Should(Receive(Equal(true)))
 			}
 
-			// Verify all health checks were cleaned up
+			// Verify all health checks are still in the map (cleanup happens in performHealthCheck, not forwardHandler)
 			mutex.Lock()
-			Expect(len(healthChecks)).To(Equal(0))
+			Expect(len(healthChecks)).To(Equal(numRequests))
+			// Clean up for the test
+			for _, testID := range testIDs {
+				delete(healthChecks, testID)
+			}
 			mutex.Unlock()
 		})
 	})
 })
 
-// errorReader is a helper type that always returns an error when read
-type errorReader struct{}
+func TestForwardHandler_NonHealthCheckRequest(t *testing.T) {
+	// Create a test downstream server
+	downstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the request was forwarded correctly (accept trailing slash)
+		if r.URL.Path != "/webhook" && r.URL.Path != "/webhook/" {
+			t.Errorf("Expected path /webhook or /webhook/, got %s", r.URL.Path)
+		}
 
-func (e *errorReader) Read(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("simulated read error")
-}
+		// Read and verify the body was forwarded correctly
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("Failed to read forwarded body: %v", err)
+		}
 
-func (e *errorReader) Close() error {
-	return nil
+		expectedBody := `{"type":"webhook","data":"test"}`
+		if string(body) != expectedBody {
+			t.Errorf("Expected body %s, got %s", expectedBody, string(body))
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer downstreamServer.Close()
+
+	// Set the downstream service URL
+	downstreamServiceURL = downstreamServer.URL + "/webhook"
+
+	// Create a test request (non-health-check)
+	requestBody := `{"type":"webhook","data":"test"}`
+	req := httptest.NewRequest("POST", "/", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	// Note: No X-Health-Check-ID header, so it should be forwarded
+
+	// Create a response recorder
+	w := httptest.NewRecorder()
+
+	// Call the handler
+	forwardHandler(w, req)
+
+	// Verify the response
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status code %d, got %d", http.StatusOK, w.Code)
+	}
+
+	if w.Body.String() != "ok" {
+		t.Errorf("Expected response body 'ok', got %s", w.Body.String())
+	}
 }
