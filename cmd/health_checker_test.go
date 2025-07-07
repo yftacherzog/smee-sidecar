@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -211,21 +209,19 @@ var _ = Describe("Health Checker", func() {
 			BeforeEach(func() {
 				// Mock server that simulates successful round-trip
 				mockServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					var payload HealthCheckPayload
-					body, err := io.ReadAll(r.Body)
-					Expect(err).NotTo(HaveOccurred())
+					// Use simplified header-based approach (only X-Health-Check-ID)
+					healthCheckID := r.Header.Get("X-Health-Check-ID")
 
-					err = json.Unmarshal(body, &payload)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Simulate the forwardHandler behavior
-					mutex.Lock()
-					if ch, ok := healthChecks[payload.ID]; ok {
-						go func() {
-							ch <- true
-						}()
+					if healthCheckID != "" {
+						// Simulate the forwardHandler behavior
+						mutex.Lock()
+						if ch, ok := healthChecks[healthCheckID]; ok {
+							go func() {
+								ch <- true
+							}()
+						}
+						mutex.Unlock()
 					}
-					mutex.Unlock()
 
 					w.WriteHeader(http.StatusOK)
 				}))
@@ -271,12 +267,12 @@ var _ = Describe("Health Checker", func() {
 				mockServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					requestCount++
 
-					var payload HealthCheckPayload
-					body, err := io.ReadAll(r.Body)
-					if err == nil {
-						json.Unmarshal(body, &payload)
+					// Use simplified header-based approach (only X-Health-Check-ID)
+					healthCheckID := r.Header.Get("X-Health-Check-ID")
+
+					if healthCheckID != "" {
 						mutex.Lock()
-						if ch, ok := healthChecks[payload.ID]; ok {
+						if ch, ok := healthChecks[healthCheckID]; ok {
 							go func() {
 								ch <- true
 							}()
