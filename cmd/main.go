@@ -82,16 +82,14 @@ func createOptimizedTransport() *http.Transport {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: "true" == os.Getenv("INSECURE_SKIP_VERIFY"),
 		},
-		// Aggressive connection pooling disable to prevent memory accumulation
-		DisableKeepAlives:     true,
-		MaxIdleConns:          0,
-		MaxIdleConnsPerHost:   0,
-		MaxConnsPerHost:       1, // Limit concurrent connections
-		IdleConnTimeout:       1 * time.Second,
+		DisableKeepAlives:     false,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       10,
+		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// Force connection closure
-		DisableCompression: true,
+		DisableCompression:    false,
 	}
 }
 
@@ -124,6 +122,9 @@ func getProxyInstance() (*httputil.ReverseProxy, error) {
 func forwardHandler(w http.ResponseWriter, r *http.Request) {
 	// Check for health check header first (fast path)
 	if healthCheckID := r.Header.Get("X-Health-Check-ID"); healthCheckID != "" {
+		// Always drain request body to prevent connection reuse issues
+		_, _ = io.Copy(io.Discard, r.Body)
+
 		mutex.Lock()
 		resultChan, exists := healthChecks[healthCheckID]
 		mutex.Unlock()
