@@ -373,9 +373,24 @@ func main() {
 	// --- Relay Server (on port 8080) ---
 	relayMux := http.NewServeMux()
 	relayMux.HandleFunc("/", forwardHandler)
+
+	// Configure relay server with timeouts to prevent goroutine leaks
+	// while maintaining transparency (timeouts longer than any realistic client)
+	relayServer := &http.Server{
+		Addr:         ":8080",
+		Handler:      relayMux,
+		ReadTimeout:  180 * time.Second, // 3 min - longer than any client timeout
+		WriteTimeout: 60 * time.Second,  // 1 min - safe response timeout
+		IdleTimeout:  600 * time.Second, // 10 min - generous keep-alive cleanup
+	}
+
 	go func() {
-		log.Println("Relay server listening on :8080")
-		if err := http.ListenAndServe(":8080", relayMux); err != nil {
+		log.Printf("Relay server listening on %s with timeouts (read: %.0fs, write: %.0fs, idle: %.0fs)",
+			relayServer.Addr,
+			relayServer.ReadTimeout.Seconds(),
+			relayServer.WriteTimeout.Seconds(),
+			relayServer.IdleTimeout.Seconds())
+		if err := relayServer.ListenAndServe(); err != nil {
 			log.Fatalf("FATAL: Relay server failed: %v", err)
 		}
 	}()
