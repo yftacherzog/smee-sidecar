@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -78,6 +82,30 @@ var _ = Describe("forwardHandler", func() {
 
 			Expect(recorder.Code).To(Equal(http.StatusOK))
 			Expect(recorder.Body.String()).To(Equal("downstream response"))
+
+			// Verify the request was forwarded to downstream
+			requestMutex.Lock()
+			Expect(len(downstreamRequests)).To(Equal(1))
+			requestMutex.Unlock()
+
+			// Verify the counter was incremented
+			Expect(testutil.ToFloat64(forwardAttempts)).To(Equal(1.0))
+		})
+
+		It("should NOT set Connection: close header for regular requests", func() {
+			payload := `{"type": "webhook", "action": "push", "repository": {"name": "test-repo"}}`
+			request, err := http.NewRequest("POST", "/", bytes.NewBufferString(payload))
+			Expect(err).NotTo(HaveOccurred())
+			request.Header.Set("Content-Type", "application/json")
+
+			forwardHandler(recorder, request)
+
+			Expect(recorder.Code).To(Equal(http.StatusOK))
+			Expect(recorder.Body.String()).To(Equal("downstream response"))
+
+			// Verify Connection: close header is NOT set for regular requests
+			connectionHeader := recorder.Header().Get("Connection")
+			Expect(connectionHeader).NotTo(Equal("close"))
 
 			// Verify the request was forwarded to downstream
 			requestMutex.Lock()
@@ -318,6 +346,29 @@ var _ = Describe("forwardHandler", func() {
 			mutex.Unlock()
 		})
 	})
+
+	It("should force connection closure to prevent connection pooling (behavioral test)", func() {
+		// Set up the global state needed for forwardHandler to work
+		mutex.Lock()
+		healthChecks = make(map[string]chan bool)
+		mutex.Unlock()
+
+		// Create a real HTTP server using the actual forwardHandler
+		testServer := httptest.NewServer(http.HandlerFunc(forwardHandler))
+		defer testServer.Close()
+
+		connections := measureConnectionBehaviorWithHealthChecks(testServer.URL, 5)
+
+		// Log the results
+		GinkgoWriter.Printf("forwardHandler created %d connections for 5 health check requests\n", connections)
+
+		// We should see more connections being created because
+		// Connection: close prevents connection reuse
+		// If the fix is working, we should see >= 3 connections for 5 requests
+		// If the fix is broken, we'd see only 1-2 connections due to reuse
+		Expect(connections).To(BeNumerically(">=", 3),
+			"forwardHandler should prevent connection reuse for health checks")
+	})
 })
 
 func TestForwardHandler_NonHealthCheckRequest(t *testing.T) {
@@ -367,4 +418,46 @@ func TestForwardHandler_NonHealthCheckRequest(t *testing.T) {
 	if w.Body.String() != "ok" {
 		t.Errorf("Expected response body 'ok', got %s", w.Body.String())
 	}
+}
+
+// measureConnectionBehaviorWithHealthChecks measures how many connections are created
+// when making health check requests to the server
+func measureConnectionBehaviorWithHealthChecks(serverURL string, requestCount int) int {
+	var connectionCount int32
+
+	// Create a custom transport to count connections
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			atomic.AddInt32(&connectionCount, 1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+		DisableKeepAlives: false,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Second * 5,
+	}
+
+	// Make multiple health check requests with the X-Health-Check-ID header
+	for i := 0; i < requestCount; i++ {
+		req, err := http.NewRequest("GET", serverURL, nil)
+		if err != nil {
+			continue
+		}
+
+		// Add health check header to trigger our fix
+		req.Header.Set("X-Health-Check-ID", fmt.Sprintf("test-%d", i))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		// Brief pause to ensure connections are properly handled
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return int(atomic.LoadInt32(&connectionCount))
 }
