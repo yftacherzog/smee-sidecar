@@ -125,6 +125,9 @@ func forwardHandler(w http.ResponseWriter, r *http.Request) {
 		// Always drain request body to prevent connection reuse issues
 		_, _ = io.Copy(io.Discard, r.Body)
 
+		// Force connection closure for health checks to prevent connection pooling
+		w.Header().Set("Connection", "close")
+
 		mutex.Lock()
 		resultChan, exists := healthChecks[healthCheckID]
 		mutex.Unlock()
