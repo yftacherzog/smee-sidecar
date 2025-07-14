@@ -33,6 +33,7 @@ downstream services, providing:
 │                    │ │ Server :9100    │                │
 │ Liveness: script   │ │                 │                │
 │                    │ │ /metrics        │ ← Prometheus   │
+│                    │ │ /debug/pprof/*  │ ← Debug (opt)  │
 │                    │ └─────────────────┘                │
 │                    │ ┌─────────────────┐                │
 │                    │ │ Shared Volume   │                │
@@ -89,6 +90,7 @@ The sidecar exposes Prometheus metrics on `:9100/metrics`:
 |`SHARED_VOLUME_PATH`            |❌      |`/shared`                  | Path to shared volume for health files  |
 |`HEALTH_FILE_PATH`              |❌      |`/shared/health-status.txt`| Path to health status file              |
 |`INSECURE_SKIP_VERIFY`          |❌      |`false`                    | Skip TLS verification for health checks |
+|`ENABLE_PPROF`                  |❌      |`false`                    | Enable pprof endpoints for debugging    |
 
 ### Example Configuration
 
@@ -103,6 +105,12 @@ env:
   - name: HEALTH_CHECK_TIMEOUT_SECONDS
     value: "20"
 ```
+
+### Debugging
+
+When `ENABLE_PPROF=true` is set (disabled by default), the management server exposes
+pprof endpoints on `:9100/debug/pprof/` for performance profiling and debugging.
+This includes endpoints for goroutine, heap, CPU profiles, and more.
 
 ## Kubernetes Deployment
 
