@@ -13,7 +13,7 @@ spec:
         app: in-cluster-smee
     spec:
       containers:
-        - image: "ghcr.io/chmouel/gosmee:v0.26.0"
+        - image: "ghcr.io/chmouel/gosmee:v0.26.1"
           imagePullPolicy: IfNotPresent
           name: gosmee
           args: ["server", "--address", "0.0.0.0"]
