@@ -32,6 +32,32 @@ stop forwarding events.
 
 ```mermaid
 graph LR
+    %% External and Server Nodes
+    A[GitHub]
+    B(Smee Server)
+
+    %% Subgraph for the VPN environment
+    subgraph "Red Hat VPN"
+        C(Smee Client)
+        D[PaC]
+
+        %% Flow within the VPN
+        C -- "PR Events" --> D
+    end
+
+    %% --- Primary Event Flow ---
+    A -- "PR Events" --> B
+    B -- "PR Events" --> C
+
+    %% --- Style Definitions (Consistent with previous charts) ---
+    style A fill:#4A90E2,color:#fff
+    style B fill:#50E3C2,color:#000
+    style C fill:#F5A623,color:#000
+    style D fill:#4A90E2,color:#fff
+```
+
+```mermaid
+graph LR
     %% External Nodes & Server
     A[GitHub]
     D[PaC]
