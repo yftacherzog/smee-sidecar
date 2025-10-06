@@ -1,10 +1,8 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-    "extends": ["github>konflux-ci/mintmaker//config/renovate/renovate.json"],
-    "ignorePaths": [
-        "!test/config/**"
-    ],
     "kubernetes": {
-        "fileMatch": ["^test/config/.*\\.ya?ml$"]
+        "managerFilePatterns": [
+            "/^test/config/.*\\.ya?ml$/"
+        ]
     }
 }
