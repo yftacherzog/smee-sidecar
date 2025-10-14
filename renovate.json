@@ -1,5 +1,9 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "prConcurrentLimit": 0,
+    "tekton": {
+        "schedule": ["* * * * *"]
+    },
     "kubernetes": {
         "managerFilePatterns": [
             "/^test/config/.*\\.ya?ml$/"
